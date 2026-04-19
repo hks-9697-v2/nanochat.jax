@@ -147,7 +147,7 @@ class GPT(nnx.Module):
     def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
         self.config = config
         self.wte = nnx.Embed(config.vocab_size, config.n_embd, rngs=rngs)
-        self.h = [Block(config, layer_idx, rngs=rngs) for layer_idx in range(config.n_layer)]
+        self.h = nnx.List([Block(config, layer_idx, rngs=rngs) for layer_idx in range(config.n_layer)])
         self.lm_head = nnx.Linear(config.n_embd, config.vocab_size, use_bias=False, rngs=rngs)
 
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
@@ -157,8 +157,8 @@ class GPT(nnx.Module):
         self.rotary_seq_len = config.sequence_len * 10
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos = cos
-        self.sin = sin
+        self.cos = nnx.Variable(cos)
+        self.sin = nnx.Variable(sin)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         # self.wte.to(dtype=jnp.bfloat16) # JAX typically handles this via mixed precision policies
 
@@ -245,8 +245,8 @@ class GPT(nnx.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         
         # truncate cache to current sequence length
-        cos = jax.lax.dynamic_slice_in_dim(self.cos, T0, T, axis=1)
-        sin = jax.lax.dynamic_slice_in_dim(self.sin, T0, T, axis=1)
+        cos = jax.lax.dynamic_slice_in_dim(self.cos.value, T0, T, axis=1)
+        sin = jax.lax.dynamic_slice_in_dim(self.sin.value, T0, T, axis=1)
         cos_sin = (cos, sin)
 
         # Forward the trunk of the Transformer

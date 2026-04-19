@@ -1,0 +1,10 @@
+pyproject.toml
+nanochat/__init__.py
+nanochat/common.py
+nanochat/dataset.py
+nanochat/gpt.py
+nanochat/tokenizer.py
+nanochat.egg-info/PKG-INFO
+nanochat.egg-info/SOURCES.txt
+nanochat.egg-info/dependency_links.txt
+nanochat.egg-info/top_level.txt
