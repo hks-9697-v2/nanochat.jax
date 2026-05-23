@@ -8,6 +8,7 @@ A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of na
 - **Distributed Mesh Sharding**: Out-of-the-box support for Data Parallelism (DP), Fully Sharded Data Parallelism (FSDP / ZeRO), and Tensor Parallelism (TP) via JAX Mesh and NamedSharding.
 - **Decoupled Data Pipeline**: Standalone offline pre-tokenization scripts writing highly compressed binary `.bin` token shards directly to arbitrary directories or cloud buckets, eliminating runtime tokenization overhead.
 - **Flawless Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state through Orbax across local file systems or cloud URIs, with dynamic sequence length and vocabulary resizing resilience.
+- **Deep Execution Profiling**: Embedded support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
 
 ---
 
@@ -26,7 +27,7 @@ pip install -e .
 You can store dataset shards and model checkpoints in any local directory or cloud storage bucket. Define your desired base storage location by exporting the `NANOCHAT_STORAGE_ROOT` environment variable:
 
 ```bash
-# Example 1: Using a direct Google Cloud Storage bucket path
+# Example 1: Using a direct cloud storage bucket path
 export NANOCHAT_STORAGE_ROOT="gs://my-cloud-bucket/nano-chat-jax"
 
 # Example 2: Using a local filesystem directory or mounted drive
@@ -91,6 +92,23 @@ python scripts/chat_cli.py \
     --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
     --prompt "The capital of France is" \
     --temperature 0.7
+```
+
+---
+
+## Profiling Server & Detailed Tracing
+
+All three execution scripts (`base_train.py`, `chat_sft.py`, `chat_cli.py`) natively integrate JAX profiling functionality, allowing you to examine XLA compile times, communication stalls, and operator performance across TensorBoard or Perfetto:
+
+```bash
+# Option 1: Start a background JAX profiler server on a specific port for live capture
+python scripts/base_train.py --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" --profile_server_port 9999
+
+# Option 2: Automatically record and dump a step-based XLA trace between specific iterations
+python scripts/chat_sft.py --load_model_tag gpt2-base-pretraining --profile_start 5 --profile_end 15 --profile_dir "/tmp/my_traces"
+
+# Option 3: Trace generation latency per token during autoregressive sampling
+python scripts/chat_cli.py --load_model_tag gpt2-chat-sft --profile_start 1 --profile_end 5
 ```
 
 ---

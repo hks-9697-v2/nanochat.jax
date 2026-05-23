@@ -2,11 +2,12 @@
 Chat Supervised Fine-Tuning (SFT) script using JAX, Flax NNX, and Optax.
 
 Prepares conversation turn data with target masking (training on assistant
-completions while ignoring prompt tokens). Supports multi-dimensional Mesh sharding
-and loading pretrained weights from GCS buckets.
+completions while ignoring prompt tokens). Supports multi-dimensional Mesh sharding,
+cloud weight loading, and complete JAX profiler server / step-based tracing.
 
 Usage:
-    python scripts/chat_sft.py --model_tag gpt2-base --num_iterations 50
+    python scripts/chat_sft.py --model_tag gpt2-base --num_iterations 50 --profile_start 5 --profile_end 15
+    python scripts/chat_sft.py --profile_server_port 9999
 """
 
 import argparse
@@ -26,19 +27,24 @@ from nanochat.checkpoint_manager import CheckpointManager
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT")
+    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Profiler Support")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
     p.add_argument("--num_iterations", type=int, default=50, help="SFT optimization steps")
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
-    p.add_argument("--gcs_bucket", type=str, default="", help="GCS bucket directory for checkpoints")
+    p.add_argument("--gcs_bucket", type=str, default="", help="Cloud storage directory for checkpoints")
     p.add_argument("--load_model_tag", type=str, default="gpt2-base", help="Checkpointed base model to load")
     p.add_argument("--save_model_tag", type=str, default="gpt2-chat-sft", help="Destination tag for SFT model")
     # Sharding
     p.add_argument("--dp", type=int, default=1, help="Data parallelism")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism")
+    # Profiler Support
+    p.add_argument("--profile_server_port", type=int, default=-1, help="Port to expose JAX profiler server (-1 = disabled)")
+    p.add_argument("--profile_start", type=int, default=-1, help="Step index to commence detailed XLA tracing")
+    p.add_argument("--profile_end", type=int, default=-1, help="Step index to finalize and dump XLA tracing")
+    p.add_argument("--profile_dir", type=str, default="/tmp/tensorboard_traces", help="Destination directory for XLA profile dumps")
     return p.parse_args()
 
 
@@ -55,6 +61,14 @@ def get_mock_conversations():
 def main():
     print_banner()
     args = parse_args()
+
+    # Step 1: Optional JAX Profiler Server Initialization
+    if args.profile_server_port > 0:
+        try:
+            jax.profiler.start_server(args.profile_server_port)
+            print0(f"JAX Profiler active on port {args.profile_server_port}. Capture via Capture Profile tool in TensorBoard/Perfetto.")
+        except Exception as e:
+            print0(f"Warning: Failed to launch profiler server on port {args.profile_server_port} ({e})")
 
     devices = jax.devices()
     mesh, data_sharding, param_sharding = setup_distributed_sharding(devices, dp=args.dp, fsdp=args.fsdp, tp=args.tp)
@@ -80,7 +94,6 @@ def main():
     base_dir = os.path.join(ckpt_root, args.load_model_tag)
     base_cm = CheckpointManager(base_dir)
     
-    # Attempt restoring base pretraining checkpoint
     if base_cm.latest_step() is not None:
         try:
             base_cm.restore_latest(model=model)
@@ -112,6 +125,22 @@ def main():
     t0 = time.time()
 
     for step in range(args.num_iterations + 1):
+        # Step-based programmatic profiler triggering
+        if step == args.profile_start:
+            os.makedirs(args.profile_dir, exist_ok=True)
+            try:
+                jax.profiler.start_trace(args.profile_dir)
+                print0(f"\n[Profiler Tracing Enabled] Initiating detailed XLA trace at step {step} to {args.profile_dir}...")
+            except Exception as e:
+                print0(f"\nWarning: Failed to initiate profiler trace ({e})")
+
+        if step == args.profile_end:
+            try:
+                jax.profiler.stop_trace()
+                print0(f"\n[Profiler Tracing Stopped] XLA trace successfully finalized and saved to {args.profile_dir}.")
+            except Exception as e:
+                print0(f"\nWarning: Failed to stop profiler trace ({e})")
+
         if step == args.num_iterations:
             sft_cm.save(step, model=model, extra={"step": step}, force=True)
             break
@@ -122,7 +151,6 @@ def main():
             conv = conversations[(step * args.device_batch_size + b) % len(conversations)]
             ids, mask = tokenizer.render_conversation(conv, max_tokens=args.max_seq_len + 1)
             
-            # Padding
             pad_len = (args.max_seq_len + 1) - len(ids)
             if pad_len > 0:
                 ids.extend([bos_token] * pad_len)
@@ -135,7 +163,6 @@ def main():
             y_arr = np.array(ids[1:], dtype=np.int32)
             mask_arr = np.array(mask[1:], dtype=np.int32)
             
-            # Apply ignore index (-1) to positions not supervised
             y_arr[mask_arr == 0] = -1
             x_rows.append(x_arr)
             y_rows.append(y_arr)
@@ -148,7 +175,7 @@ def main():
         jax.block_until_ready(loss)
         dt = time.time() - step_t0
 
-        if step % 10 == 0 or step == args.num_iterations - 1:
+        if step % 10 == 0 or step == args.num_iterations - 1 or (args.profile_start <= step < args.profile_end):
             print0(f"Step {step:05d}/{args.num_iterations:05d} | SFT Loss: {loss.item():.4f} | {dt*1000:.1f}ms")
 
     sft_cm.close()

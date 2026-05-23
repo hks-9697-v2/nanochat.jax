@@ -3,10 +3,11 @@ Base model pretraining script using JAX, Flax NNX, and Optax.
 
 Utilizes Grain shared-memory loading over pre-tokenized binary (.bin) token shards
 persisted in GCS storage buckets. Eliminates runtime tokenization overhead entirely.
-Supports distributed multi-axis Mesh sharding (DP, FSDP, TP).
+Supports distributed multi-axis Mesh sharding (DP, FSDP, TP) and JAX profiler tracing.
 
 Usage:
-    python scripts/base_train.py --shard_dir "/home/iharsh_google_com/iharsh-fuse/dataset_tokens" --num_iterations 100
+    python scripts/base_train.py --shard_dir "/path/to/tokens" --profile_start 10 --profile_end 30
+    python scripts/base_train.py --profile_server_port 9999
 """
 
 import argparse
@@ -29,7 +30,7 @@ from nanochat.loss_eval import evaluate_bpb
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining on GCS Token Shards")
+    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining on Cloud Token Shards with Profiler Support")
     # Architecture
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
@@ -43,17 +44,30 @@ def parse_args():
     p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
-    # GCS Ingestion and Checkpoint Root
-    p.add_argument("--shard_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="GCS bucket directory containing pre-tokenized .bin shards")
-    p.add_argument("--gcs_bucket", type=str, default="/home/iharsh_google_com/iharsh-fuse/checkpoints", help="GCS bucket directory for model weight checkpoints")
+    # Storage Root
+    p.add_argument("--shard_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
+    p.add_argument("--gcs_bucket", type=str, default="/home/iharsh_google_com/iharsh-fuse/checkpoints", help="Cloud storage directory for model weight checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
     p.add_argument("--eval_every", type=int, default=50, help="Evaluate validation BPB interval")
+    # Profiler Arguments
+    p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
+    p.add_argument("--profile_start", type=int, default=-1, help="Step index to start XLA trace recording")
+    p.add_argument("--profile_end", type=int, default=-1, help="Step index to stop XLA trace recording")
+    p.add_argument("--profile_dir", type=str, default="/tmp/tensorboard_traces", help="Trace destination directory")
     return p.parse_args()
 
 
 def main():
     print_banner()
     args = parse_args()
+
+    # Step 1: Optional JAX Profiler Server Initialization
+    if args.profile_server_port > 0:
+        try:
+            jax.profiler.start_server(args.profile_server_port)
+            print0(f"JAX Profiler active on port {args.profile_server_port}. Capture via Capture Profile tool in TensorBoard/Perfetto.")
+        except Exception as e:
+            print0(f"Warning: Failed to launch profiler server on port {args.profile_server_port} ({e})")
 
     devices = jax.devices()
     print0(f"Found {len(devices)} JAX devices: {devices}")
@@ -62,7 +76,6 @@ def main():
     )
     print0(f"Distributed mesh initialized with shape (DP={args.dp}, FSDP={args.fsdp}, TP={args.tp})")
 
-    # Locate pre-tokenized shards
     shard_files = sorted(glob.glob(os.path.join(args.shard_dir, "*.bin")))
     if not shard_files:
         raise FileNotFoundError(
@@ -121,7 +134,6 @@ def main():
     tokens_per_iter = args.device_batch_size * args.max_seq_len
     grad_accum_steps = max(1, args.total_batch_size // tokens_per_iter)
     
-    # Initialize high-throughput pre-tokenized loader
     train_loader = pretokenized_distributed_data_loader(
         args.device_batch_size, args.max_seq_len, split="train", shard_files=shard_files
     )
@@ -131,6 +143,22 @@ def main():
     x_np, y_np = next(train_loader)
 
     for step in range(args.num_iterations + 1):
+        # Programmatic Step Profiling
+        if step == args.profile_start:
+            os.makedirs(args.profile_dir, exist_ok=True)
+            try:
+                jax.profiler.start_trace(args.profile_dir)
+                print0(f"\n[Profiler Tracing Enabled] Initiating detailed XLA trace at step {step} to {args.profile_dir}...")
+            except Exception as e:
+                print0(f"\nWarning: Failed to initiate profiler trace ({e})")
+
+        if step == args.profile_end:
+            try:
+                jax.profiler.stop_trace()
+                print0(f"\n[Profiler Tracing Stopped] XLA trace successfully finalized and saved to {args.profile_dir}.")
+            except Exception as e:
+                print0(f"\nWarning: Failed to stop profiler trace ({e})")
+
         if step == args.num_iterations:
             ckpt_manager.save(step, model=model, extra={"step": step, "params": total_params}, force=True)
             break
@@ -146,7 +174,7 @@ def main():
         step_dt = time.time() - step_start
         tok_per_sec = int((tokens_per_iter * grad_accum_steps) / step_dt) if step_dt > 0 else 0
 
-        if step % 10 == 0 or step == args.num_iterations - 1:
+        if step % 10 == 0 or step == args.num_iterations - 1 or (args.profile_start <= step < args.profile_end):
             print0(f"Step {step:05d}/{args.num_iterations:05d} | Loss: {loss.item():.4f} | Throughput: {tok_per_sec:,} tok/s")
 
     ckpt_manager.close()
