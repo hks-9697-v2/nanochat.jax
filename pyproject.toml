@@ -1,6 +1,19 @@
 [project]
 name = "nanochat"
 version = "0.1.0"
+dependencies = [
+    "jax[tpu]",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+    "grain-nightly",
+    "pyarrow",
+    "requests",
+    "tiktoken",
+    "tokenizers",
+    "psutil",
+    "pytest",
+]
 
 [build-system]
 requires = ["setuptools"]

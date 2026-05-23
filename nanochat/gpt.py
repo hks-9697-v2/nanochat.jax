@@ -14,6 +14,7 @@ Notable features:
 from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 
@@ -245,8 +246,10 @@ class GPT(nnx.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         
         # truncate cache to current sequence length
-        cos = jax.lax.dynamic_slice_in_dim(self.cos.value, T0, T, axis=1)
-        sin = jax.lax.dynamic_slice_in_dim(self.sin.value, T0, T, axis=1)
+        cos_val = self.cos.get_value() if hasattr(self.cos, 'get_value') else self.cos.value
+        sin_val = self.sin.get_value() if hasattr(self.sin, 'get_value') else self.sin.value
+        cos = jax.lax.dynamic_slice_in_dim(cos_val, T0, T, axis=1)
+        sin = jax.lax.dynamic_slice_in_dim(sin_val, T0, T, axis=1)
         cos_sin = (cos, sin)
 
         # Forward the trunk of the Transformer
@@ -303,3 +306,62 @@ class GPT(nnx.Module):
             ids = jnp.concatenate([ids, next_ids], axis=1)
             token = next_ids[0, 0].item()
             yield token
+
+
+class KVCache(nnx.Module):
+    def __init__(self, config: GPTConfig, max_batch_size: int = 1):
+        self.pos = nnx.Variable(jnp.array(0, dtype=jnp.int32))
+        head_dim = config.n_embd // config.n_head
+        self.k_cache = nnx.Variable(jnp.zeros((config.n_layer, max_batch_size, config.n_kv_head, config.sequence_len, head_dim)))
+        self.v_cache = nnx.Variable(jnp.zeros((config.n_layer, max_batch_size, config.n_kv_head, config.sequence_len, head_dim)))
+
+    def get_pos(self):
+        return self.pos.get_value() if hasattr(self.pos, 'get_value') else self.pos.value
+
+    def insert_kv(self, layer_idx: int, k: jnp.ndarray, v: jnp.ndarray):
+        pos = self.get_pos()
+        B, n_kv_head, T, head_dim = k.shape
+        k_val = self.k_cache.get_value() if hasattr(self.k_cache, 'get_value') else self.k_cache.value
+        v_val = self.v_cache.get_value() if hasattr(self.v_cache, 'get_value') else self.v_cache.value
+        new_k = jax.lax.dynamic_update_slice(k_val[layer_idx], k, (0, 0, pos, 0))
+        new_v = jax.lax.dynamic_update_slice(v_val[layer_idx], v, (0, 0, pos, 0))
+        
+        updated_k = k_val.at[layer_idx].set(new_k)
+        updated_v = v_val.at[layer_idx].set(new_v)
+        if hasattr(self.k_cache, 'set_value'):
+            self.k_cache.set_value(updated_k)
+            self.v_cache.set_value(updated_v)
+        else:
+            self.k_cache.value = updated_k
+            self.v_cache.value = updated_v
+        
+        ret_k = new_k[:, :, :pos + T, :]
+        ret_v = new_v[:, :, :pos + T, :]
+        return ret_k, ret_v
+
+    def update_pos(self, step: int):
+        new_pos = self.get_pos() + step
+        if hasattr(self.pos, 'set_value'):
+            self.pos.set_value(new_pos)
+        else:
+            self.pos.value = new_pos
+
+
+def setup_distributed_sharding(devices, dp: int = 1, fsdp: int = 1, tp: int = 1):
+    """
+    Setup Mesh and NamedSharding for Data Parallelism, FSDP, and Tensor Parallelism.
+    """
+    total_needed = dp * fsdp * tp
+    available = len(devices)
+    if available < total_needed:
+        # Fallback to 1D mesh if running locally / unit tests
+        mesh = jax.sharding.Mesh(devices, ('dp',))
+        data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dp', None))
+        param_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        return mesh, data_sharding, param_sharding
+
+    device_grid = np.array(devices[:total_needed], dtype=object).reshape((dp, fsdp, tp))
+    mesh = jax.sharding.Mesh(device_grid, ('dp', 'fsdp', 'tp'))
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(('dp', 'fsdp'), None))
+    param_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('tp', None))
+    return mesh, data_sharding, param_sharding

@@ -149,7 +149,10 @@ class HuggingFaceTokenizer:
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
-import rustbpe
+try:
+    import rustbpe
+except ImportError:
+    rustbpe = None
 import tiktoken
 
 class RustBPETokenizer:
@@ -162,6 +165,8 @@ class RustBPETokenizer:
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
         # 1) train using rustbpe
+        if rustbpe is None:
+            raise ImportError("rustbpe is not installed, required for training new tokenizers.")
         tokenizer = rustbpe.Tokenizer()
         # the special tokens are inserted later in __init__, we don't train them here
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
@@ -184,19 +189,29 @@ class RustBPETokenizer:
     @classmethod
     def from_directory(cls, tokenizer_dir):
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        if not os.path.exists(pickle_path):
+            print(f"Tokenizer not found at {pickle_path}, falling back to gpt2 tiktoken encoding")
+            return cls.from_pretrained("gpt2")
         with open(pickle_path, "rb") as f:
             enc = pickle.load(f)
         return cls(enc, "<|bos|>")
 
     @classmethod
     def from_pretrained(cls, tiktoken_name):
-        # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
         enc = tiktoken.get_encoding(tiktoken_name)
-        # tiktoken calls the special document delimiter token "<|endoftext|>"
-        # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
-        # it most often is used to signal the start of a new sequence to the LLM during inference etc.
-        # so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
-        return cls(enc, "<|endoftext|>")
+        base_special = enc._special_tokens
+        offset = enc.n_vocab
+        new_special = dict(base_special)
+        for i, token_str in enumerate(SPECIAL_TOKENS):
+            if token_str not in new_special:
+                new_special[token_str] = offset + i
+        new_enc = tiktoken.Encoding(
+            name=f"{tiktoken_name}_expanded",
+            pat_str=enc._pat_str,
+            mergeable_ranks=enc._mergeable_ranks,
+            special_tokens=new_special,
+        )
+        return cls(new_enc, "<|endoftext|>")
 
     def get_vocab_size(self):
         return self.enc.n_vocab
@@ -380,7 +395,6 @@ def get_tokenizer():
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes():
