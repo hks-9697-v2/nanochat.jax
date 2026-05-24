@@ -8,7 +8,7 @@ customizable Grain concurrency, flawless GCS parameter binding, ultra-fast targe
 and animated real-time terminal progress loading spinners.
 
 Usage:
-    python scripts/base_train.py --shard_dir "gs://iharsh-fuse/nano-chat-jax/dataset"
+    python scripts/base_train.py --shard_dir "gs://your-bucket-name/nano-chat-jax/dataset"
 """
 
 import argparse
@@ -24,6 +24,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
+
+# Apple Silicon jax-metal plugin is currently unstable with Flax NNX PRNG operations.
+# Forcing CPU backend for local Mac development to prevent 'default_memory_space is not supported' JaxRuntimeErrors.
+if sys.platform == "darwin":
+    jax.config.update("jax_platform_name", "cpu")
+
 
 from nanochat.gpt import GPT, GPTConfig, setup_distributed_sharding
 from nanochat.dataloader import pretokenized_distributed_data_loader
@@ -45,8 +51,8 @@ def parse_args():
     p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
-    p.add_argument("--shard_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
-    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string for model weight checkpoints")
+    p.add_argument("--shard_dir", type=str, default="gs://your-bucket-name/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
+    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/checkpoints/full-dataset-run", help="Direct GCS bucket string for model weight checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
     p.add_argument("--ckpt_every", type=int, default=500, help="Step interval for asynchronous distributed checkpoint saving")
     p.add_argument("--eval_every", type=int, default=50, help="Evaluate validation BPB interval")
@@ -166,7 +172,7 @@ def main():
     print0(f"Vocabulary size: {vocab_size:,}")
 
     model_dim = args.depth * 64
-    num_heads = max(1, (model_dim + 127) // 128)
+    num_heads = model_dim // (128 if model_dim % 128 == 0 else 64)
     config = GPTConfig(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,

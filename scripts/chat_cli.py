@@ -7,7 +7,7 @@ ultra-fast targeted single-step checkpoint synchronization, real-time animated l
 and raw pretraining continuation formatting.
 
 Usage:
-    python scripts/chat_cli.py --gcs_bucket "gs://iharsh-fuse/checkpoints/full-dataset-run" --load_model_tag final_sft_model -p "The capital of France is"
+    python scripts/chat_cli.py --gcs_bucket "gs://your-bucket-name/checkpoints/full-dataset-run" --load_model_tag final_sft_model -p "The capital of France is"
 """
 
 import argparse
@@ -37,7 +37,7 @@ def parse_args():
     p.add_argument("--top_k", type=int, default=40, help="Top-k filtering threshold")
     p.add_argument("--load_model_tag", type=str, default="final_sft_model", help="Model checkpoint tag to restore")
     p.add_argument("--load_step", type=int, default=-1, help="Explicit checkpoint step to restore (-1 = latest)")
-    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string")
+    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/checkpoints/full-dataset-run", help="Direct GCS bucket string")
     p.add_argument("--raw_pretrain", action="store_true", help="Omit conversational special delimiters (<|bos|>) for pure base model evaluations")
     # Profiler Support
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
@@ -123,7 +123,7 @@ def main():
     vocab_size = tokenizer.get_vocab_size()
 
     model_dim = args.depth * 64
-    num_heads = max(1, (model_dim + 127) // 128)
+    num_heads = model_dim // (128 if model_dim % 128 == 0 else 64)
     config = GPTConfig(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,

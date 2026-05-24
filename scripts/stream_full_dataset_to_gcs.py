@@ -9,7 +9,7 @@ Operates with bounded disk usage (<500MB) by iterating shard-by-shard:
 4. Purges local disk cache before proceeding to next shard.
 
 Usage:
-    python scripts/stream_full_dataset_to_gcs.py --target_gcs "gs://iharsh-fuse/nano-chat-jax/dataset"
+    python scripts/stream_full_dataset_to_gcs.py --target_gcs "gs://your-bucket-name/nano-chat-jax/dataset"
 """
 
 import argparse
@@ -28,7 +28,7 @@ from nanochat.common import print0, print_banner
 
 def parse_args():
     p = argparse.ArgumentParser(description="nanoChat.jax Complete GCS Streaming Dataset Pipeline")
-    p.add_argument("--target_gcs", type=str, default="gs://iharsh-fuse/nano-chat-jax/dataset", help="Destination GCS bucket path")
+    p.add_argument("--target_gcs", type=str, default="gs://your-bucket-name/nano-chat-jax/dataset", help="Destination GCS bucket path")
     p.add_argument("--start_shard", type=int, default=0, help="Shard index to commence processing from")
     p.add_argument("--max_shards", type=int, default=MAX_SHARD + 1, help="Total dataset shards to stream")
     p.add_argument("--staging_dir", type=str, default="/tmp/nanochat_staging", help="Ephemeral staging directory for binary shards")

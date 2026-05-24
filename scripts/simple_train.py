@@ -70,7 +70,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # Model shape from depth
 num_layers = depth
 model_dim = depth * 64
-num_heads = max(1, (model_dim + 127) // 128)
+num_heads = model_dim // (128 if model_dim % 128 == 0 else 64)
 num_kv_heads = num_heads
 print0(f"num_layers: {num_layers} | model_dim: {model_dim} | num_heads: {num_heads}")
 

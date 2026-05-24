@@ -7,8 +7,8 @@ Features ultra-fast targeted single-step checkpoint synchronization and real-tim
 
 Usage:
     python scripts/chat_sft.py \
-        --gcs_bucket "gs://iharsh-fuse/nano-chat-jax/checkpoints/full-dataset-run" \
-        --sft_dataset_path "gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl" \
+        --gcs_bucket "gs://your-bucket-name/nano-chat-jax/checkpoints/full-dataset-run" \
+        --sft_dataset_path "gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl" \
         --load_model_tag base_trained_gpt2_full \
         --save_model_tag final_sft_model
 """
@@ -40,8 +40,8 @@ def parse_args():
     p.add_argument("--num_iterations", type=int, default=500, help="SFT optimization steps")
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
-    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/nano-chat-jax/checkpoints/full-dataset-run", help="GCS bucket for model checkpoints")
-    p.add_argument("--sft_dataset_path", type=str, default="gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl", help="Path to SFT dataset file (.jsonl)")
+    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/nano-chat-jax/checkpoints/full-dataset-run", help="GCS bucket for model checkpoints")
+    p.add_argument("--sft_dataset_path", type=str, default="gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl", help="Path to SFT dataset file (.jsonl)")
     p.add_argument("--load_model_tag", type=str, default="base_trained_gpt2_full", help="Checkpointed base model to load")
     p.add_argument("--save_model_tag", type=str, default="final_sft_model", help="Destination tag for SFT model")
     p.add_argument("--ckpt_every", type=int, default=100, help="Step interval for checkpoint saving")
@@ -172,7 +172,7 @@ def main():
     vocab_size = tokenizer.get_vocab_size()
 
     model_dim = args.depth * 64
-    num_heads = max(1, (model_dim + 127) // 128)
+    num_heads = model_dim // (128 if model_dim % 128 == 0 else 64)
     config = GPTConfig(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,

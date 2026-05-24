@@ -79,6 +79,11 @@ python scripts/base_train.py \
     --model_tag base_trained_gpt2_full
 ```
 
+> [!TIP]
+> **Local Testing on MacBooks / Apple Silicon**
+> If you are testing this pipeline locally on a macOS device, the framework will gracefully fallback to the CPU backend to avoid experimental Metal plugin incompatibilities with Flax NNX. Be sure to scale down `--fsdp 1` (as MacBooks are single-device) and limit `--grain_workers 4` to avoid choking your local CPU threads.
+
+
 ### 3. Supervised Fine-Tuning (SFT) with Targeted Single-Step Syncing
 
 Fine-tune your model on conversational turns using target mask filtering (training on assistant responses while ignoring prompts). Bypass corrupted preemption saves by explicitly specifying healthy pretraining steps (`--load_step`):

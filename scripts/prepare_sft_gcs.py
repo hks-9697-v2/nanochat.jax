@@ -6,7 +6,7 @@ and saves it directly to Google Cloud Storage as a structured JSONLines file (.j
 for supervised fine-tuning.
 
 Usage:
-    python scripts/prepare_sft_gcs.py --gcs_path "gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl"
+    python scripts/prepare_sft_gcs.py --gcs_path "gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl"
 """
 
 import argparse
@@ -22,7 +22,7 @@ def parse_args():
     p.add_argument(
         "--gcs_path",
         type=str,
-        default="gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl",
+        default="gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl",
         help="Target GCS path for SFT jsonl dataset",
     )
     p.add_argument(
@@ -36,6 +36,14 @@ def parse_args():
 
 def upload_to_gcs(local_file, remote_uri):
     """Direct upload via gcloud storage command execution."""
+    if not remote_uri.startswith("gs://"):
+        print(f"Copying SFT dataset to local path: {remote_uri} ...")
+        import shutil
+        os.makedirs(os.path.dirname(remote_uri) or ".", exist_ok=True)
+        shutil.copy(local_file, remote_uri)
+        print(f"Successfully copied SFT dataset to {remote_uri}")
+        return
+
     print(f"Uploading local SFT dataset to GCS: {remote_uri} ...")
     cmd = f"gcloud storage cp {local_file} {remote_uri}"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)

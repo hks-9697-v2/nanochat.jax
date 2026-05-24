@@ -6,7 +6,7 @@ with visible tqdm progress tracking, encodes raw strings into tokens using tikto
 and persists highly compressed binary token shards (.bin) directly into GCS bucket paths.
 
 Usage:
-    python scripts/prepare_dataset_gcs.py --target_dir "/home/iharsh_google_com/iharsh-fuse/dataset_tokens"
+    python scripts/prepare_dataset_gcs.py --target_dir "gs://your-bucket-name/dataset_tokens"
 """
 
 import argparse
@@ -22,7 +22,7 @@ from nanochat.common import print0, print_banner
 
 def parse_args():
     p = argparse.ArgumentParser(description="nanoChat.jax Standalone GCS Tokenizer Prep")
-    p.add_argument("--target_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="Target GCS bucket directory for .bin token shards")
+    p.add_argument("--target_dir", type=str, default="gs://your-bucket-name/dataset_tokens", help="Target GCS bucket directory for .bin token shards")
     p.add_argument("--max_shards", type=int, default=1, help="Max raw dataset parquet shards to process")
     p.add_argument("--doc_limit", type=int, default=5000, help="Document count limit for fast initial testing")
     return p.parse_args()
