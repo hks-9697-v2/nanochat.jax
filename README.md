@@ -7,8 +7,9 @@ A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of na
 - **Flax NNX Framework**: Pure, intuitive object-oriented state management combined with JAX's powerful transformations.
 - **Distributed Mesh Sharding**: Out-of-the-box support for Data Parallelism (DP), Fully Sharded Data Parallelism (FSDP / ZeRO), and Tensor Parallelism (TP) via JAX Mesh and NamedSharding.
 - **Decoupled Data Pipeline**: Standalone offline pre-tokenization scripts writing highly compressed binary `.bin` token shards directly to arbitrary directories or cloud buckets, eliminating runtime tokenization overhead.
-- **Flawless Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state through Orbax across local file systems or cloud URIs, with dynamic sequence length and vocabulary resizing resilience.
+- **Flawless Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state through Orbax across local file systems or cloud URIs, with dynamic sequence length, vocabulary resizing resilience, and configurable save intervals.
 - **Deep Execution Profiling**: Embedded support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
+- **Optimized Concurrency Budgeting**: Completely customizable Grain read worker thread allocation and internal MapDataset buffer capacities to balance system RAM and parallel I/O throughput.
 
 ---
 
@@ -54,24 +55,27 @@ python scripts/prepare_dataset_gcs.py \
 
 *Note*: You can customize the base download directory for raw parquet files by setting the `NANOCHAT_BASE_DIR` environment variable.
 
-### 2. Base Model Pretraining
+### 2. Base Model Pretraining (Grain Tuners & Checkpoint Schedules)
 
-Train a base model from scratch using Grain shared-memory streaming over pre-tokenized binary shards.
+Train a base model from scratch using Grain shared-memory streaming over pre-tokenized binary shards. Explicitly tune parallel read workers, memory prefetching, and asynchronous checkpoint save intervals (`--ckpt_every`):
 
 ```bash
 python scripts/base_train.py \
     --depth 12 \
-    --num_iterations 1000 \
+    --num_iterations 10000 \
     --device_batch_size 4 \
     --dp 1 --fsdp 1 --tp 1 \
     --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
     --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
+    --grain_workers 8 \
+    --grain_buffer_size 32 \
+    --ckpt_every 500 \
     --model_tag gpt2-base-pretraining
 ```
 
 ### 3. Supervised Fine-Tuning (SFT)
 
-Tune the base model on conversation turns with target mask filtering (learning on assistant responses while ignoring prompts). Features automatic fallback vocabulary growth when special conversational tags are introduced.
+Tune the base model on conversation turns with target mask filtering (learning on assistant responses while ignoring prompts). Features automatic fallback vocabulary growth and interim checkpoint preservation (`--ckpt_every`).
 
 ```bash
 python scripts/chat_sft.py \
@@ -79,6 +83,7 @@ python scripts/chat_sft.py \
     --save_model_tag gpt2-chat-sft \
     --num_iterations 200 \
     --learning_rate 5e-5 \
+    --ckpt_every 50 \
     --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints"
 ```
 

@@ -181,14 +181,14 @@ class LoadShardTokens(grain.transforms.Map):
         }
 
 
-def make_grain_shard_loader(files):
+def make_grain_shard_loader(files, grain_workers=4, grain_buffer_size=16):
     """Build a grain iterator that loads .bin shards in parallel."""
     ds = grain.MapDataset.source([str(p) for p in files]).map(LoadShardTokens())
     performance_config = grain.experimental.pick_performance_config(
         ds=ds,
         ram_budget_mb=1024 * 10,
-        max_workers=None,
-        max_buffer_size=None,
+        max_workers=grain_workers,
+        max_buffer_size=grain_buffer_size,
     )
     ds = ds.to_iter_dataset(read_options=performance_config.read_options)
     return ds
@@ -198,7 +198,7 @@ def make_grain_shard_loader(files):
 # Pre-tokenized data loader  (grain + BOSFinder)
 # ============================================================================
 
-def pretokenized_distributed_data_loader(B, T, split, shard_files):
+def pretokenized_distributed_data_loader(B, T, split, shard_files, grain_workers=4, grain_buffer_size=16):
     """Yield (inputs, targets) as numpy int32/int64 arrays from .bin shards.
 
     Parameters
@@ -211,6 +211,10 @@ def pretokenized_distributed_data_loader(B, T, split, shard_files):
         ``"train"`` or ``"val"``.
     shard_files : list[str | Path]
         Paths to ``.bin`` shard files.
+    grain_workers : int
+        Number of Grain workers for shared memory extraction.
+    grain_buffer_size : int
+        MapDataset read buffer pool size.
 
     Yields
     ------
@@ -221,7 +225,7 @@ def pretokenized_distributed_data_loader(B, T, split, shard_files):
     needed = T + 1  # +1 for targets
 
     while True:
-        shard_iter = make_grain_shard_loader(shard_files)
+        shard_iter = make_grain_shard_loader(shard_files, grain_workers=grain_workers, grain_buffer_size=grain_buffer_size)
         for shard in shard_iter:
             tokens = np.asarray(shard["tokens"], dtype=np.int64)
             finder = BOSFinder(tokens)

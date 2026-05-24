@@ -2,12 +2,12 @@
 Base model pretraining script using JAX, Flax NNX, and Optax.
 
 Utilizes Grain shared-memory loading over pre-tokenized binary (.bin) token shards
-persisted in GCS storage buckets. Eliminates runtime tokenization overhead entirely.
-Supports distributed multi-axis Mesh sharding (DP, FSDP, TP) and JAX profiler tracing.
+persisted in cloud storage buckets. Eliminates runtime tokenization overhead entirely.
+Supports distributed multi-axis Mesh sharding (DP, FSDP, TP), JAX profiler tracing,
+customizable Grain concurrency, and flawless checkpoint interval resumption.
 
 Usage:
-    python scripts/base_train.py --shard_dir "/path/to/tokens" --profile_start 10 --profile_end 30
-    python scripts/base_train.py --profile_server_port 9999
+    python scripts/base_train.py --shard_dir "/path/to/tokens" --ckpt_every 500
 """
 
 import argparse
@@ -30,7 +30,7 @@ from nanochat.loss_eval import evaluate_bpb
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining on Cloud Token Shards with Profiler Support")
+    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining on Cloud Token Shards with Resumption & Concurrency Tuners")
     # Architecture
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
@@ -44,11 +44,15 @@ def parse_args():
     p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
-    # Storage Root
+    # Storage Root & Logging Intervals
     p.add_argument("--shard_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
     p.add_argument("--gcs_bucket", type=str, default="/home/iharsh_google_com/iharsh-fuse/checkpoints", help="Cloud storage directory for model weight checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
+    p.add_argument("--ckpt_every", type=int, default=500, help="Step interval for asynchronous distributed checkpoint saving")
     p.add_argument("--eval_every", type=int, default=50, help="Evaluate validation BPB interval")
+    # Grain Concurrency & Read Budgeting
+    p.add_argument("--grain_workers", type=int, default=4, help="Number of parallel Grain read worker threads")
+    p.add_argument("--grain_buffer_size", type=int, default=16, help="Grain map read buffer pool capacity")
     # Profiler Arguments
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
     p.add_argument("--profile_start", type=int, default=-1, help="Step index to start XLA trace recording")
@@ -61,7 +65,6 @@ def main():
     print_banner()
     args = parse_args()
 
-    # Step 1: Optional JAX Profiler Server Initialization
     if args.profile_server_port > 0:
         try:
             jax.profiler.start_server(args.profile_server_port)
@@ -123,6 +126,18 @@ def main():
     with jax.set_mesh(mesh):
         opt_state = nnx.Optimizer(model, opt, wrt=nnx.Param)
 
+    # Seamless Checkpoint Resumption Check
+    start_step = 0
+    if ckpt_manager.latest_step() is not None:
+        try:
+            restored_step, _, restored_opt, extra = ckpt_manager.restore_latest(model=model, opt_state=opt_state)
+            start_step = restored_step
+            if restored_opt is not None:
+                opt_state = restored_opt
+            print0(f"Resumed training state from saved checkpoint at step {start_step}.")
+        except ValueError as e:
+            print0(f"Warning: Restoration invariant encountered ({e}). Commencing pretraining from initial state.")
+
     @nnx.jit
     def train_step(model, opt_state, x, y):
         def loss_fn(model):
@@ -134,16 +149,17 @@ def main():
     tokens_per_iter = args.device_batch_size * args.max_seq_len
     grad_accum_steps = max(1, args.total_batch_size // tokens_per_iter)
     
+    print0(f"Initializing Grain MapDataset loader (Workers={args.grain_workers}, Pre-Buffer={args.grain_buffer_size})...")
     train_loader = pretokenized_distributed_data_loader(
-        args.device_batch_size, args.max_seq_len, split="train", shard_files=shard_files
+        args.device_batch_size, args.max_seq_len, split="train", shard_files=shard_files,
+        grain_workers=args.grain_workers, grain_buffer_size=args.grain_buffer_size
     )
 
-    print0(f"\n--- Commencing Instant Base Pretraining for {args.num_iterations} iterations ---")
+    print0(f"\n--- Commencing Instant Base Pretraining (Steps {start_step} -> {args.num_iterations}) ---")
     start_time = time.time()
     x_np, y_np = next(train_loader)
 
-    for step in range(args.num_iterations + 1):
-        # Programmatic Step Profiling
+    for step in range(start_step, args.num_iterations + 1):
         if step == args.profile_start:
             os.makedirs(args.profile_dir, exist_ok=True)
             try:
@@ -158,6 +174,10 @@ def main():
                 print0(f"\n[Profiler Tracing Stopped] XLA trace successfully finalized and saved to {args.profile_dir}.")
             except Exception as e:
                 print0(f"\nWarning: Failed to stop profiler trace ({e})")
+
+        if step > start_step and step % args.ckpt_every == 0 and step < args.num_iterations:
+            print0(f"\n[Interim Checkpoint Target] Saving training state at step {step}...")
+            ckpt_manager.save(step, model=model, extra={"step": step, "params": total_params}, force=True)
 
         if step == args.num_iterations:
             ckpt_manager.save(step, model=model, extra={"step": step, "params": total_params}, force=True)

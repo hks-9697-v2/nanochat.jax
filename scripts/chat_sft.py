@@ -3,11 +3,10 @@ Chat Supervised Fine-Tuning (SFT) script using JAX, Flax NNX, and Optax.
 
 Prepares conversation turn data with target masking (training on assistant
 completions while ignoring prompt tokens). Supports multi-dimensional Mesh sharding,
-cloud weight loading, and complete JAX profiler server / step-based tracing.
+cloud weight loading, complete JAX profiler tracing, and custom checkpoint intervals.
 
 Usage:
-    python scripts/chat_sft.py --model_tag gpt2-base --num_iterations 50 --profile_start 5 --profile_end 15
-    python scripts/chat_sft.py --profile_server_port 9999
+    python scripts/chat_sft.py --model_tag gpt2-base --num_iterations 200 --ckpt_every 50
 """
 
 import argparse
@@ -27,7 +26,7 @@ from nanochat.checkpoint_manager import CheckpointManager
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Profiler Support")
+    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Custom Intervals & Profiler Support")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
     p.add_argument("--num_iterations", type=int, default=50, help="SFT optimization steps")
@@ -36,6 +35,7 @@ def parse_args():
     p.add_argument("--gcs_bucket", type=str, default="", help="Cloud storage directory for checkpoints")
     p.add_argument("--load_model_tag", type=str, default="gpt2-base", help="Checkpointed base model to load")
     p.add_argument("--save_model_tag", type=str, default="gpt2-chat-sft", help="Destination tag for SFT model")
+    p.add_argument("--ckpt_every", type=int, default=25, help="Step interval for asynchronous distributed checkpoint saving")
     # Sharding
     p.add_argument("--dp", type=int, default=1, help="Data parallelism")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding")
@@ -62,7 +62,6 @@ def main():
     print_banner()
     args = parse_args()
 
-    # Step 1: Optional JAX Profiler Server Initialization
     if args.profile_server_port > 0:
         try:
             jax.profiler.start_server(args.profile_server_port)
@@ -125,7 +124,6 @@ def main():
     t0 = time.time()
 
     for step in range(args.num_iterations + 1):
-        # Step-based programmatic profiler triggering
         if step == args.profile_start:
             os.makedirs(args.profile_dir, exist_ok=True)
             try:
@@ -141,11 +139,14 @@ def main():
             except Exception as e:
                 print0(f"\nWarning: Failed to stop profiler trace ({e})")
 
+        if step > 0 and step % args.ckpt_every == 0 and step < args.num_iterations:
+            print0(f"\n[Interim Checkpoint Target] Saving SFT state at step {step}...")
+            sft_cm.save(step, model=model, extra={"step": step}, force=True)
+
         if step == args.num_iterations:
             sft_cm.save(step, model=model, extra={"step": step}, force=True)
             break
 
-        # Batch assembly with masking
         x_rows, y_rows = [], []
         for b in range(args.device_batch_size):
             conv = conversations[(step * args.device_batch_size + b) % len(conversations)]
