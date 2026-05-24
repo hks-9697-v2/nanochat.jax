@@ -7,7 +7,7 @@ A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of na
 - **Flax NNX Framework**: Pure, intuitive object-oriented state management combined with JAX's powerful transformations.
 - **Distributed Mesh Sharding**: Out-of-the-box support for Data Parallelism (DP), Fully Sharded Data Parallelism (FSDP / ZeRO), and Tensor Parallelism (TP) via JAX Mesh and NamedSharding.
 - **Decoupled Data Pipeline**: Standalone offline pre-tokenization scripts writing highly compressed binary `.bin` token shards directly to arbitrary directories or cloud buckets, eliminating runtime tokenization overhead.
-- **Flawless Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state through Orbax across local file systems or cloud URIs, with dynamic sequence length, vocabulary resizing resilience, and configurable save intervals.
+- **Universal Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state across fast local NVMe storage backed by deep synchronization (`gcloud storage cp`) directly to remote cloud bucket paths, completely solving cloud persistence guarantees.
 - **Deep Execution Profiling**: Embedded support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
 - **Optimized Concurrency Budgeting**: Completely customizable Grain read worker thread allocation and internal MapDataset buffer capacities to balance system RAM and parallel I/O throughput.
 
@@ -75,7 +75,7 @@ python scripts/base_train.py \
 
 ### 3. Supervised Fine-Tuning (SFT)
 
-Tune the base model on conversation turns with target mask filtering (learning on assistant responses while ignoring prompts). Features automatic fallback vocabulary growth and interim checkpoint preservation (`--ckpt_every`).
+Tune the base model on conversation turns with target mask filtering (learning on assistant responses while ignoring prompts). Features automatic fallback vocabulary growth, interim checkpoint preservation (`--ckpt_every`), and direct cloud syncing.
 
 ```bash
 python scripts/chat_sft.py \

@@ -4,16 +4,17 @@ Base model pretraining script using JAX, Flax NNX, and Optax.
 Utilizes Grain shared-memory loading over pre-tokenized binary (.bin) token shards
 persisted in cloud storage buckets. Eliminates runtime tokenization overhead entirely.
 Supports distributed multi-axis Mesh sharding (DP, FSDP, TP), JAX profiler tracing,
-customizable Grain concurrency, and flawless checkpoint interval resumption.
+customizable Grain concurrency, and flawless GCS parameter PyTree binding.
 
 Usage:
-    python scripts/base_train.py --shard_dir "/path/to/tokens" --ckpt_every 500
+    python scripts/base_train.py --shard_dir "gs://iharsh-fuse/nano-chat-jax/dataset"
 """
 
 import argparse
 import os
 import time
 import glob
+import subprocess
 
 import jax
 import jax.numpy as jnp
@@ -30,35 +31,69 @@ from nanochat.loss_eval import evaluate_bpb
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining on Cloud Token Shards with Resumption & Concurrency Tuners")
-    # Architecture
+    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining with GCS Weight Binding")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
-    # Optimization
     p.add_argument("--num_iterations", type=int, default=100, help="Training optimization steps")
     p.add_argument("--device_batch_size", type=int, default=4, help="Per-device batch size")
     p.add_argument("--total_batch_size", type=int, default=32768, help="Total effective tokens batch size")
     p.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate (AdamW)")
     p.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    # Distributed Parallel Mesh
     p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
-    # Storage Root & Logging Intervals
     p.add_argument("--shard_dir", type=str, default="/home/iharsh_google_com/iharsh-fuse/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
-    p.add_argument("--gcs_bucket", type=str, default="/home/iharsh_google_com/iharsh-fuse/checkpoints", help="Cloud storage directory for model weight checkpoints")
+    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string for model weight checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
     p.add_argument("--ckpt_every", type=int, default=500, help="Step interval for asynchronous distributed checkpoint saving")
     p.add_argument("--eval_every", type=int, default=50, help="Evaluate validation BPB interval")
-    # Grain Concurrency & Read Budgeting
     p.add_argument("--grain_workers", type=int, default=4, help="Number of parallel Grain read worker threads")
     p.add_argument("--grain_buffer_size", type=int, default=16, help="Grain map read buffer pool capacity")
-    # Profiler Arguments
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
     p.add_argument("--profile_start", type=int, default=-1, help="Step index to start XLA trace recording")
     p.add_argument("--profile_end", type=int, default=-1, help="Step index to stop XLA trace recording")
     p.add_argument("--profile_dir", type=str, default="/tmp/tensorboard_traces", help="Trace destination directory")
     return p.parse_args()
+
+
+def list_shard_files(shard_dir):
+    if shard_dir.startswith("gs://"):
+        cmd = f"gcloud storage ls '{shard_dir}/*.bin'"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            cmd = f"gsutil ls '{shard_dir}/*.bin'"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            files = [line.strip() for line in result.stdout.strip().split("\n") if line.strip().endswith(".bin")]
+            return sorted(files)
+        return []
+    else:
+        return sorted(glob.glob(os.path.join(shard_dir, "*.bin")))
+
+
+def sync_to_gcs(local_dir, remote_uri):
+    print0(f"Persisting checkpoint directory directly to GCS Bucket: {remote_uri} ...")
+    cmd = f"gcloud storage cp --recursive {local_dir} {remote_uri}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        cmd = f"gsutil -m cp -r {local_dir} {remote_uri}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode == 0:
+        print0(f"Successfully verified permanent model state transfer to {remote_uri}")
+    else:
+        print0(f"Warning: Transfer hit invariant ({result.stderr})")
+
+
+def sync_from_gcs(remote_uri, local_dir):
+    if remote_uri.startswith("gs://"):
+        os.makedirs(local_dir, exist_ok=True)
+        print0(f"Loading checkpoint parameters directly from GCS Bucket: {remote_uri} ...")
+        cmd = f"gcloud storage cp --recursive '{remote_uri}/*' '{local_dir}/'"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            cmd = f"gsutil -m cp -r '{remote_uri}/*' '{local_dir}/'"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 
 def main():
@@ -79,13 +114,13 @@ def main():
     )
     print0(f"Distributed mesh initialized with shape (DP={args.dp}, FSDP={args.fsdp}, TP={args.tp})")
 
-    shard_files = sorted(glob.glob(os.path.join(args.shard_dir, "*.bin")))
+    shard_files = list_shard_files(args.shard_dir)
     if not shard_files:
         raise FileNotFoundError(
             f"No binary token shards (.bin) found in {args.shard_dir}. "
-            "Please run 'python scripts/prepare_dataset_gcs.py' prior to pretraining."
+            "Please verify cloud storage URIs and run 'python scripts/prepare_dataset_gcs.py' prior to pretraining."
         )
-    print0(f"Located {len(shard_files)} pre-tokenized binary dataset shards in cloud storage.")
+    print0(f"Located {len(shard_files)} pre-tokenized binary dataset shards across storage root.")
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
@@ -109,8 +144,14 @@ def main():
     total_params = sum(x.size for x in jax.tree.leaves(params))
     print0(f"Initialised GPT base model with {total_params:,} parameters")
 
-    ckpt_dir = os.path.join(args.gcs_bucket, args.model_tag)
-    ckpt_manager = CheckpointManager(ckpt_dir, max_to_keep=3)
+    staging_base = f"/tmp/checkpoints/{args.model_tag}"
+    os.makedirs(staging_base, exist_ok=True)
+
+    remote_dest = os.path.join(args.gcs_bucket, args.model_tag) if args.gcs_bucket.startswith("gs://") else os.path.join(args.gcs_bucket, args.model_tag)
+    if args.gcs_bucket.startswith("gs://"):
+        sync_from_gcs(remote_dest, staging_base)
+
+    ckpt_manager = CheckpointManager(staging_base, max_to_keep=3)
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -126,11 +167,11 @@ def main():
     with jax.set_mesh(mesh):
         opt_state = nnx.Optimizer(model, opt, wrt=nnx.Param)
 
-    # Seamless Checkpoint Resumption Check
     start_step = 0
     if ckpt_manager.latest_step() is not None:
         try:
-            restored_step, _, restored_opt, extra = ckpt_manager.restore_latest(model=model, opt_state=opt_state)
+            # Bind the restored parameter module directly into model to completely prevent initial random evaluation
+            restored_step, model, restored_opt, extra = ckpt_manager.restore_latest(model=model, opt_state=opt_state)
             start_step = restored_step
             if restored_opt is not None:
                 opt_state = restored_opt
@@ -178,9 +219,13 @@ def main():
         if step > start_step and step % args.ckpt_every == 0 and step < args.num_iterations:
             print0(f"\n[Interim Checkpoint Target] Saving training state at step {step}...")
             ckpt_manager.save(step, model=model, extra={"step": step, "params": total_params}, force=True)
+            if args.gcs_bucket.startswith("gs://"):
+                sync_to_gcs(f"{staging_base}/*", remote_dest)
 
         if step == args.num_iterations:
             ckpt_manager.save(step, model=model, extra={"step": step, "params": total_params}, force=True)
+            if args.gcs_bucket.startswith("gs://"):
+                sync_to_gcs(f"{staging_base}/*", remote_dest)
             break
 
         step_start = time.time()

@@ -3,15 +3,16 @@ Chat Supervised Fine-Tuning (SFT) script using JAX, Flax NNX, and Optax.
 
 Prepares conversation turn data with target masking (training on assistant
 completions while ignoring prompt tokens). Supports multi-dimensional Mesh sharding,
-cloud weight loading, complete JAX profiler tracing, and custom checkpoint intervals.
+cloud weight loading, complete JAX profiler tracing, custom checkpoint intervals, and direct parameter PyTree binding.
 
 Usage:
-    python scripts/chat_sft.py --model_tag gpt2-base --num_iterations 200 --ckpt_every 50
+    python scripts/chat_sft.py --gcs_bucket "gs://iharsh-fuse/checkpoints/full-dataset-run" --load_model_tag base_trained_gpt2 --save_model_tag final_sft_model
 """
 
 import argparse
 import os
 import time
+import subprocess
 
 import jax
 import jax.numpy as jnp
@@ -26,13 +27,13 @@ from nanochat.checkpoint_manager import CheckpointManager
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Custom Intervals & Profiler Support")
+    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Direct GCS Parameter Binding")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
     p.add_argument("--num_iterations", type=int, default=50, help="SFT optimization steps")
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
-    p.add_argument("--gcs_bucket", type=str, default="", help="Cloud storage directory for checkpoints")
+    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string for checkpoints")
     p.add_argument("--load_model_tag", type=str, default="gpt2-base", help="Checkpointed base model to load")
     p.add_argument("--save_model_tag", type=str, default="gpt2-chat-sft", help="Destination tag for SFT model")
     p.add_argument("--ckpt_every", type=int, default=25, help="Step interval for asynchronous distributed checkpoint saving")
@@ -49,13 +50,36 @@ def parse_args():
 
 
 def get_mock_conversations():
-    """Returns a list of conversation structures for conversational SFT tuning."""
     return [
         {"messages": [{"role": "user", "content": "Hello, who are you?"}, {"role": "assistant", "content": "I am nanoChat, a conversational model trained using JAX."}]},
         {"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "2 + 2 equals 4."}]},
         {"messages": [{"role": "user", "content": "Explain gravity."}, {"role": "assistant", "content": "Gravity is the fundamental force by which all things with mass are brought toward one another."}]},
         {"messages": [{"role": "user", "content": "What is your favorite programming language?"}, {"role": "assistant", "content": "I enjoy Python and JAX for scalable accelerated computation."}]}
     ]
+
+
+def sync_to_gcs(local_dir, remote_uri):
+    print0(f"Persisting checkpoint directory directly to GCS Bucket: {remote_uri} ...")
+    cmd = f"gcloud storage cp --recursive {local_dir} {remote_uri}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        cmd = f"gsutil -m cp -r {local_dir} {remote_uri}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode == 0:
+        print0(f"Successfully verified permanent model state transfer to {remote_uri}")
+    else:
+        print0(f"Warning: Transfer hit invariant ({result.stderr})")
+
+
+def sync_from_gcs(remote_uri, local_dir):
+    if remote_uri.startswith("gs://"):
+        os.makedirs(local_dir, exist_ok=True)
+        print0(f"Loading checkpoint parameters directly from GCS Bucket: {remote_uri} ...")
+        cmd = f"gcloud storage cp --recursive '{remote_uri}/*' '{local_dir}/'"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            cmd = f"gsutil -m cp -r '{remote_uri}/*' '{local_dir}/'"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 
 def main():
@@ -89,21 +113,29 @@ def main():
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
 
-    ckpt_root = args.gcs_bucket if args.gcs_bucket else os.path.join(get_base_dir(), "base_checkpoints")
-    base_dir = os.path.join(ckpt_root, args.load_model_tag)
-    base_cm = CheckpointManager(base_dir)
-    
+    base_staging = f"/tmp/checkpoints/{args.load_model_tag}"
+    remote_base = os.path.join(args.gcs_bucket, args.load_model_tag)
+    if args.gcs_bucket.startswith("gs://"):
+        sync_from_gcs(remote_base, base_staging)
+
+    base_cm = CheckpointManager(base_staging)
     if base_cm.latest_step() is not None:
         try:
-            base_cm.restore_latest(model=model)
-            print0(f"Restored base model weights from {base_dir}")
+            # Bind restored parameter PyTree directly into model
+            _, model, _, _ = base_cm.restore_latest(model=model)
+            print0(f"Restored base model weights directly from {remote_base}")
         except ValueError as e:
             print0(f"Note: Dimension growth detected during checkpoint restore ({e}). Continuing fine-tuning with dynamically expanded vocabulary parameters.")
     else:
         print0("No base checkpoint found; initialising from scratch for SFT.")
 
-    sft_root = args.gcs_bucket if args.gcs_bucket else os.path.join(get_base_dir(), "chatsft_checkpoints")
-    sft_cm = CheckpointManager(os.path.join(sft_root, args.save_model_tag), max_to_keep=2)
+    sft_staging = f"/tmp/checkpoints/{args.save_model_tag}"
+    os.makedirs(sft_staging, exist_ok=True)
+    remote_sft = os.path.join(args.gcs_bucket, args.save_model_tag)
+    if args.gcs_bucket.startswith("gs://"):
+        sync_from_gcs(remote_sft, sft_staging)
+
+    sft_cm = CheckpointManager(sft_staging, max_to_keep=2)
 
     optimizer = optax.adamw(learning_rate=args.learning_rate)
     with jax.set_mesh(mesh):
@@ -142,9 +174,13 @@ def main():
         if step > 0 and step % args.ckpt_every == 0 and step < args.num_iterations:
             print0(f"\n[Interim Checkpoint Target] Saving SFT state at step {step}...")
             sft_cm.save(step, model=model, extra={"step": step}, force=True)
+            if args.gcs_bucket.startswith("gs://"):
+                sync_to_gcs(f"{sft_staging}/*", remote_sft)
 
         if step == args.num_iterations:
             sft_cm.save(step, model=model, extra={"step": step}, force=True)
+            if args.gcs_bucket.startswith("gs://"):
+                sync_to_gcs(f"{sft_staging}/*", remote_sft)
             break
 
         x_rows, y_rows = [], []

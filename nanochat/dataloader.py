@@ -157,7 +157,24 @@ class LoadShardTokens(grain.transforms.Map):
     """Grain map transform: read a .bin shard into shared memory."""
 
     def map(self, path):
-        file = Path(path)
+        orig_path = str(path)
+        if orig_path.startswith("gs://") or orig_path.startswith("gs:/"):
+            # Reconstruct clean GCS URI after Grain Path.resolve() slash normalization
+            clean_uri = "gs://" + orig_path.replace("gs://", "").replace("gs:/", "").lstrip("/")
+            import os, subprocess
+            cache_dir = "/tmp/grain_staging"
+            os.makedirs(cache_dir, exist_ok=True)
+            filename = clean_uri.split("/")[-1]
+            local_path = os.path.join(cache_dir, filename)
+            if not os.path.exists(local_path):
+                cmd = f"gcloud storage cp '{clean_uri}' '{local_path}'"
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if r.returncode != 0:
+                    cmd = f"gsutil cp '{clean_uri}' '{local_path}'"
+                    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            file = Path(local_path)
+        else:
+            file = Path(orig_path)
 
         header = np.fromfile(str(file), count=256, dtype=np.int32)
         assert header[0] == 20240520, "magic number mismatch in the data .bin file"
@@ -174,7 +191,7 @@ class LoadShardTokens(grain.transforms.Map):
 
         bos_idx = np.flatnonzero(tokens == BOS_ID)
         return {
-            "path": str(file),
+            "path": orig_path,
             "tokens": tokens,
             "bos_idx": bos_idx,
             "size": num_tokens,

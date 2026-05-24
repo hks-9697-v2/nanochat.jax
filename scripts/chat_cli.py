@@ -2,15 +2,15 @@
 Interactive CLI generation script for nanoChat.jax.
 
 Accepts prompts and performs autoregressive sampling using Flax NNX.
-Optionally integrates with cloud storage buckets and complete JAX profiler server / step tracing.
+Optionally integrates with direct GCS parameter binding and JAX profiler tracing.
 
 Usage:
-    python scripts/chat_cli.py --prompt "The capital of France is" --profile_start 1 --profile_end 15
-    python scripts/chat_cli.py --profile_server_port 9999
+    python scripts/chat_cli.py --gcs_bucket "gs://iharsh-fuse/checkpoints/full-dataset-run" --load_model_tag final_sft_model -p "The capital of France is"
 """
 
 import argparse
 import os
+import subprocess
 
 import jax
 import jax.numpy as jnp
@@ -23,21 +23,32 @@ from nanochat.checkpoint_manager import CheckpointManager
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Inference CLI with Profiler Support")
+    p = argparse.ArgumentParser(description="nanoChat.jax Inference CLI with Direct GCS Parameter Binding")
     p.add_argument("-p", "--prompt", type=str, default="The capital of France is", help="Prompt text")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
     p.add_argument("--max_tokens", type=int, default=32, help="Maximum generated tokens")
     p.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     p.add_argument("--top_k", type=int, default=40, help="Top-k filtering threshold")
-    p.add_argument("--load_model_tag", type=str, default="gpt2-chat-sft", help="Model checkpoint tag to restore")
-    p.add_argument("--gcs_bucket", type=str, default="", help="Optional cloud storage path")
+    p.add_argument("--load_model_tag", type=str, default="final_sft_model", help="Model checkpoint tag to restore")
+    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string")
     # Profiler Support
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
     p.add_argument("--profile_start", type=int, default=-1, help="Token index to start XLA trace recording")
     p.add_argument("--profile_end", type=int, default=-1, help="Token index to stop XLA trace recording")
     p.add_argument("--profile_dir", type=str, default="/tmp/tensorboard_traces", help="Trace destination directory")
     return p.parse_args()
+
+
+def sync_from_gcs(remote_uri, local_dir):
+    if remote_uri.startswith("gs://"):
+        os.makedirs(local_dir, exist_ok=True)
+        print0(f"Loading checkpoint parameters directly from GCS Bucket: {remote_uri} ...")
+        cmd = f"gcloud storage cp --recursive '{remote_uri}/*' '{local_dir}/'"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            cmd = f"gsutil -m cp -r '{remote_uri}/*' '{local_dir}/'"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 
 def main():
@@ -71,27 +82,22 @@ def main():
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
 
-    ckpt_root = args.gcs_bucket if args.gcs_bucket else os.path.join(get_base_dir(), "chatsft_checkpoints")
-    model_dir = os.path.join(ckpt_root, args.load_model_tag)
-    cm = CheckpointManager(model_dir)
+    staging_base = f"/tmp/checkpoints/{args.load_model_tag}"
+    remote_model = os.path.join(args.gcs_bucket, args.load_model_tag)
+    if args.gcs_bucket.startswith("gs://"):
+        sync_from_gcs(remote_model, staging_base)
+
+    cm = CheckpointManager(staging_base)
 
     if cm.latest_step() is not None:
         try:
-            cm.restore_latest(model=model)
-            print0(f"Restored model weights from {model_dir}")
+            # Bind restored parameter module directly into model
+            _, model, _, _ = cm.restore_latest(model=model)
+            print0(f"Restored model weights directly from {remote_model}")
         except ValueError as e:
             print0(f"Note: Rotary buffer shape mismatch detected during restore ({e}). Running inference with resiliently matched shapes.")
     else:
-        base_dir = os.path.join(os.path.join(get_base_dir(), "base_checkpoints"), "gpt2-base")
-        base_cm = CheckpointManager(base_dir)
-        if base_cm.latest_step() is not None:
-            try:
-                base_cm.restore_latest(model=model)
-                print0(f"Restored base model weights from {base_dir}")
-            except ValueError as e:
-                print0(f"Note: Resilient base model load ({e}).")
-        else:
-            print0("No checkpoint found; running inference with initialised weights.")
+        print0("No checkpoint found; running inference with initialised weights.")
 
     tokens = tokenizer.encode(args.prompt, prepend="<|bos|>")
     rng = jax.random.PRNGKey(42)
