@@ -5,11 +5,10 @@ A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of na
 ## Architectural Innovations & Production Alignment
 
 - **Flax NNX Framework**: Pure, intuitive object-oriented state management combined with JAX's powerful functional transformations.
-- **MaxText Production Architecture Equivalence**: Natively wrap and validate cloud paths using `etils.epath` matching official MaxText production standards (`create_orbax_checkpoint_manager`), entirely resolving multi-platform cloud network pathing invariants.
 - **Deep Execution Profiling**: Built-in support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
 - **Decoupled Data Pipeline**: Offline pre-tokenization scripts writing highly compressed binary `.bin` token shards or clean SFT JSONLines files directly to arbitrary local directories or remote cloud storage buckets, eliminating runtime processing overhead.
-- **Ultra-Fast Targeted Checkpoint Synchronization**: Prevents disk space exhaustion and network clogs by fetching only targeted single-step checkpoint directories (`--load_step <N>`) from GCS rather than downloading massive historical parameter checkpoints.
-- **Animated Real-Time Loading Spinners**: Embedded multithreaded terminal spinners across all networking scripts to maintain clear visual feedback during long cloud transfers.
+- **Checkpoint Synchronization**: Prevents disk space exhaustion and network clogs by fetching only targeted single-step checkpoint directories (`--load_step <N>`) from GCS rather than downloading massive historical parameter checkpoints.
+
 - **Universal Parameter Binding**: Automatically binds restored checkpoint weights into active optimization modules, supporting resilient shape expansions for dynamic vocabulary additions.
 
 ---
