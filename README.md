@@ -1,31 +1,33 @@
 # nanoChat.jax
 
-A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of nanoChat. Designed for clean scaling laws analysis, fast iteration, and robust distributed parallelism on TPUs and GPUs.
+A minimal, highly elegant, research-friendly JAX / Flax NNX implementation of nanoChat. Designed for clean scaling laws analysis, high-speed iteration, and robust distributed parallelism on TPUs and GPUs.
 
-## Architecture Highlights
+## Architectural Innovations & Production Alignment
 
-- **Flax NNX Framework**: Pure, intuitive object-oriented state management combined with JAX's powerful transformations.
-- **Distributed Mesh Sharding**: Out-of-the-box support for Data Parallelism (DP), Fully Sharded Data Parallelism (FSDP / ZeRO), and Tensor Parallelism (TP) via JAX Mesh and NamedSharding.
-- **Decoupled Data Pipeline**: Standalone offline pre-tokenization scripts writing highly compressed binary `.bin` token shards directly to arbitrary directories or cloud buckets, eliminating runtime tokenization overhead.
-- **Universal Resilient Checkpointing**: Natively checkpoint and restore model/optimizer state across fast local NVMe storage backed by deep synchronization (`gcloud storage cp`) directly to remote cloud bucket paths, completely solving cloud persistence guarantees.
-- **Deep Execution Profiling**: Embedded support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
-- **Optimized Concurrency Budgeting**: Completely customizable Grain read worker thread allocation and internal MapDataset buffer capacities to balance system RAM and parallel I/O throughput.
+- **Flax NNX Framework**: Pure, intuitive object-oriented state management combined with JAX's powerful functional transformations.
+- **MaxText Production Architecture Equivalence**: Natively wrap and validate cloud paths using `etils.epath` matching official MaxText production standards (`create_orbax_checkpoint_manager`), entirely resolving multi-platform cloud network pathing invariants.
+- **Deep Execution Profiling**: Built-in support for live JAX Profiler servers and step-based XLA trace recordings across pretraining, fine-tuning, and inference routines.
+- **Decoupled Data Pipeline**: Offline pre-tokenization scripts writing highly compressed binary `.bin` token shards or clean SFT JSONLines files directly to arbitrary local directories or remote cloud storage buckets, eliminating runtime processing overhead.
+- **Ultra-Fast Targeted Checkpoint Synchronization**: Prevents disk space exhaustion and network clogs by fetching only targeted single-step checkpoint directories (`--load_step <N>`) from GCS rather than downloading massive historical parameter checkpoints.
+- **Animated Real-Time Loading Spinners**: Embedded multithreaded terminal spinners across all networking scripts to maintain clear visual feedback during long cloud transfers.
+- **Universal Parameter Binding**: Automatically binds restored checkpoint weights into active optimization modules, supporting resilient shape expansions for dynamic vocabulary additions.
 
 ---
 
 ## Setup & Installation
 
-Create a virtual environment and install dependencies (including `jax[tpu]`):
+Create a virtual environment and install dependencies (including `jax[tpu]` and `datasets`):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+pip install datasets
 ```
 
-### Configuring Storage Location
+### Configuring Storage Locations
 
-You can store dataset shards and model checkpoints in any local directory or cloud storage bucket. Define your desired base storage location by exporting the `NANOCHAT_STORAGE_ROOT` environment variable:
+You can store dataset shards, SFT conversations, and model checkpoints in any local directory or cloud storage bucket. Define your desired base storage location by exporting the `NANOCHAT_STORAGE_ROOT` environment variable:
 
 ```bash
 # Example 1: Using a direct cloud storage bucket path
@@ -39,81 +41,100 @@ export NANOCHAT_STORAGE_ROOT="/mnt/local_shared_disk/nano-chat-jax"
 
 ## Complete Execution Lifecycle
 
-### 1. Dataset Ingestion & Offline Pre-Tokenization
+### 1. Dataset Ingestion & Pre-Tokenization
 
-Download raw parquet files from Hugging Face and prepare highly compressed binary `.bin` token shards with visible progress metrics (`tqdm`):
+Download raw text parquet files or conversational turn dialogues from Hugging Face and prepare highly optimized datasets:
 
 ```bash
-# Explicitly download raw parquet files using parallel worker threads
+# Explicitly download raw pretraining parquet files using parallel worker threads
 python -m nanochat.dataset --num-files 5 --num-workers 4
 
-# Pre-tokenize dataset offline and persist binary shards directly to your configured storage root
+# Pre-tokenize pretraining dataset offline and persist binary shards directly to storage root
 python scripts/prepare_dataset_gcs.py \
     --target_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
     --doc_limit 10000
+
+# Compile medium-sized high-quality SFT dialogue dataset from Ultrachat and upload structured JSONLines directly to GCS
+python scripts/prepare_sft_gcs.py \
+    --gcs_path "$NANOCHAT_STORAGE_ROOT/sft_dataset/sft_conversations.jsonl" \
+    --limit 25000
 ```
 
 *Note*: You can customize the base download directory for raw parquet files by setting the `NANOCHAT_BASE_DIR` environment variable.
 
-### 2. Base Model Pretraining (Grain Tuners & Checkpoint Schedules)
+### 2. Base Model Pretraining (Grain Tuners & MaxText Checkpoint Architecture)
 
-Train a base model from scratch using Grain shared-memory streaming over pre-tokenized binary shards. Explicitly tune parallel read workers, memory prefetching, and asynchronous checkpoint save intervals (`--ckpt_every`):
+Train a base model from scratch using Grain shared-memory streaming over pre-tokenized binary shards. Features robust MaxText cloud alignment, step resumption from cloud checkpoints, and animated progress spinners:
 
 ```bash
 python scripts/base_train.py \
     --depth 12 \
-    --num_iterations 10000 \
+    --num_iterations 35000 \
     --device_batch_size 4 \
-    --dp 1 --fsdp 1 --tp 1 \
+    --dp 1 --fsdp 8 --tp 1 \
     --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
     --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
-    --grain_workers 8 \
-    --grain_buffer_size 32 \
+    --grain_workers 16 \
+    --grain_buffer_size 512 \
     --ckpt_every 500 \
-    --model_tag gpt2-base-pretraining
+    --model_tag base_trained_gpt2_full
 ```
 
-### 3. Supervised Fine-Tuning (SFT)
+### 3. Supervised Fine-Tuning (SFT) with Targeted Single-Step Syncing
 
-Tune the base model on conversation turns with target mask filtering (learning on assistant responses while ignoring prompts). Features automatic fallback vocabulary growth, interim checkpoint preservation (`--ckpt_every`), and direct cloud syncing.
+Fine-tune your model on conversational turns using target mask filtering (training on assistant responses while ignoring prompts). Bypass corrupted preemption saves by explicitly specifying healthy pretraining steps (`--load_step`):
 
 ```bash
 python scripts/chat_sft.py \
-    --load_model_tag gpt2-base-pretraining \
-    --save_model_tag gpt2-chat-sft \
-    --num_iterations 200 \
-    --learning_rate 5e-5 \
-    --ckpt_every 50 \
-    --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints"
+    --sft_dataset_path "$NANOCHAT_STORAGE_ROOT/sft_dataset/sft_conversations.jsonl" \
+    --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
+    --load_model_tag base_trained_gpt2_full \
+    --save_model_tag final_sft_model \
+    --load_step 30000 \
+    --num_iterations 500 \
+    --device_batch_size 4 \
+    --max_seq_len 1024 \
+    --dp 1 --fsdp 8 --tp 1 \
+    --ckpt_every 100
 ```
 
-### 4. Interactive CLI Generation
+### 4. Interactive CLI Generation (Dual-Mode Evaluation)
 
-Run autoregressive generation using KV cache streaming over restored SFT parameters.
+Evaluate autoregressive text streaming on either conversational assistant models or raw base models using `--raw_pretrain` to skip special delimiters:
 
 ```bash
+# Mode 1: Evaluate conversational fine-tuning response alignment
 python scripts/chat_cli.py \
-    --load_model_tag gpt2-chat-sft \
     --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
-    --prompt "The capital of France is" \
+    --load_model_tag final_sft_model \
+    --prompt "What is the capital of France?" \
     --temperature 0.7
+
+# Mode 2: Evaluate pure base pretraining knowledge distributions without special prompt delimiters
+python scripts/chat_cli.py \
+    --gcs_bucket "$NANOCHAT_STORAGE_ROOT/checkpoints" \
+    --load_model_tag base_trained_gpt2_full \
+    --load_step 30000 \
+    --prompt "The capital of France is" \
+    --raw_pretrain \
+    --temperature 0.8
 ```
 
 ---
 
 ## Profiling Server & Detailed Tracing
 
-All three execution scripts (`base_train.py`, `chat_sft.py`, `chat_cli.py`) natively integrate JAX profiling functionality, allowing you to examine XLA compile times, communication stalls, and operator performance across TensorBoard or Perfetto:
+All three core execution scripts (`base_train.py`, `chat_sft.py`, `chat_cli.py`) natively integrate JAX profiling functionality, allowing you to examine XLA compile times, communication stalls, and operator performance across TensorBoard or Perfetto:
 
 ```bash
 # Option 1: Start a background JAX profiler server on a specific port for live capture
 python scripts/base_train.py --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" --profile_server_port 9999
 
 # Option 2: Automatically record and dump a step-based XLA trace between specific iterations
-python scripts/chat_sft.py --load_model_tag gpt2-base-pretraining --profile_start 5 --profile_end 15 --profile_dir "/tmp/my_traces"
+python scripts/chat_sft.py --load_model_tag base_trained_gpt2_full --profile_start 5 --profile_end 15 --profile_dir "/tmp/my_traces"
 
 # Option 3: Trace generation latency per token during autoregressive sampling
-python scripts/chat_cli.py --load_model_tag gpt2-chat-sft --profile_start 1 --profile_end 5
+python scripts/chat_cli.py --load_model_tag final_sft_model --profile_start 1 --profile_end 5
 ```
 
 ---

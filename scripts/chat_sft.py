@@ -1,18 +1,25 @@
 """
 Chat Supervised Fine-Tuning (SFT) script using JAX, Flax NNX, and Optax.
 
-Prepares conversation turn data with target masking (training on assistant
-completions while ignoring prompt tokens). Supports multi-dimensional Mesh sharding,
-cloud weight loading, complete JAX profiler tracing, custom checkpoint intervals, and direct parameter PyTree binding.
+Loads conversational instruction datasets directly from local files or remote GCS buckets,
+applies conversational delimiters, and performs multi-device sharded target-masked training.
+Features ultra-fast targeted single-step checkpoint synchronization and real-time animated terminal progress loading spinners.
 
 Usage:
-    python scripts/chat_sft.py --gcs_bucket "gs://iharsh-fuse/checkpoints/full-dataset-run" --load_model_tag base_trained_gpt2 --save_model_tag final_sft_model
+    python scripts/chat_sft.py \
+        --gcs_bucket "gs://iharsh-fuse/nano-chat-jax/checkpoints/full-dataset-run" \
+        --sft_dataset_path "gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl" \
+        --load_model_tag base_trained_gpt2_full \
+        --save_model_tag final_sft_model
 """
 
 import argparse
 import os
+import sys
 import time
+import json
 import subprocess
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -21,25 +28,27 @@ import optax
 from flax import nnx
 
 from nanochat.gpt import GPT, GPTConfig, setup_distributed_sharding
-from nanochat.common import print0, print_banner, get_base_dir
+from nanochat.common import print0, print_banner
 from nanochat.tokenizer import get_tokenizer
 from nanochat.checkpoint_manager import CheckpointManager
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Direct GCS Parameter Binding")
+    p = argparse.ArgumentParser(description="nanoChat.jax Chat SFT with Dynamic Loading Spinners")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
-    p.add_argument("--num_iterations", type=int, default=50, help="SFT optimization steps")
+    p.add_argument("--num_iterations", type=int, default=500, help="SFT optimization steps")
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
-    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/checkpoints/full-dataset-run", help="Direct GCS bucket string for checkpoints")
-    p.add_argument("--load_model_tag", type=str, default="gpt2-base", help="Checkpointed base model to load")
-    p.add_argument("--save_model_tag", type=str, default="gpt2-chat-sft", help="Destination tag for SFT model")
-    p.add_argument("--ckpt_every", type=int, default=25, help="Step interval for asynchronous distributed checkpoint saving")
+    p.add_argument("--gcs_bucket", type=str, default="gs://iharsh-fuse/nano-chat-jax/checkpoints/full-dataset-run", help="GCS bucket for model checkpoints")
+    p.add_argument("--sft_dataset_path", type=str, default="gs://iharsh-fuse/nano-chat-jax/sft_dataset/sft_conversations.jsonl", help="Path to SFT dataset file (.jsonl)")
+    p.add_argument("--load_model_tag", type=str, default="base_trained_gpt2_full", help="Checkpointed base model to load")
+    p.add_argument("--save_model_tag", type=str, default="final_sft_model", help="Destination tag for SFT model")
+    p.add_argument("--ckpt_every", type=int, default=100, help="Step interval for checkpoint saving")
+    p.add_argument("--load_step", type=int, default=-1, help="Explicit step number to restore from checkpoint tag (-1 = latest)")
     # Sharding
     p.add_argument("--dp", type=int, default=1, help="Data parallelism")
-    p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding")
+    p.add_argument("--fsdp", type=int, default=8, help="FSDP / ZeRO sharding")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism")
     # Profiler Support
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to expose JAX profiler server (-1 = disabled)")
@@ -49,37 +58,100 @@ def parse_args():
     return p.parse_args()
 
 
-def get_mock_conversations():
-    return [
-        {"messages": [{"role": "user", "content": "Hello, who are you?"}, {"role": "assistant", "content": "I am nanoChat, a conversational model trained using JAX."}]},
-        {"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "2 + 2 equals 4."}]},
-        {"messages": [{"role": "user", "content": "Explain gravity."}, {"role": "assistant", "content": "Gravity is the fundamental force by which all things with mass are brought toward one another."}]},
-        {"messages": [{"role": "user", "content": "What is your favorite programming language?"}, {"role": "assistant", "content": "I enjoy Python and JAX for scalable accelerated computation."}]}
-    ]
+def run_with_progress(cmd, desc):
+    """Executes long network storage operations with a visible real-time progress loading spinner."""
+    spinner_symbols = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    stop_spinner = False
+    proc_container = {}
+
+    def spin():
+        i = 0
+        while not stop_spinner:
+            sys.stdout.write(f"\r{spinner_symbols[i]} {desc} ...")
+            sys.stdout.flush()
+            i = (i + 1) % len(spinner_symbols)
+            time.sleep(0.1)
+
+    t_spin = threading.Thread(target=spin)
+    t_spin.start()
+
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    stop_spinner = True
+    t_spin.join()
+
+    sys.stdout.write(f"\r[Completed] {desc} \n")
+    sys.stdout.flush()
+    return proc
+
+
+def load_sft_dataset(path):
+    orig_path = str(path)
+    if orig_path.startswith("gs://"):
+        local_dest = "/tmp/sft_dataset_staging.jsonl"
+        cmd = f"gcloud storage cp {orig_path} {local_dest}"
+        res = run_with_progress(cmd, f"Syncing remote SFT dataset: {orig_path}")
+        if res.returncode != 0:
+            cmd = f"gsutil cp {orig_path} {local_dest}"
+            run_with_progress(cmd, f"Syncing remote SFT dataset (gsutil fallback)")
+        target_file = local_dest
+    else:
+        target_file = orig_path
+
+    if not os.path.exists(target_file):
+        raise FileNotFoundError(f"SFT dataset file not found at: {target_file}")
+
+    print0("Parsing conversations from dataset...")
+    conversations = []
+    with open(target_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                conversations.append(json.loads(line.strip()))
+    
+    print0(f"Successfully loaded {len(conversations):,} conversations for supervised fine-tuning.")
+    return conversations
 
 
 def sync_to_gcs(local_dir, remote_uri):
-    print0(f"Persisting checkpoint directory directly to GCS Bucket: {remote_uri} ...")
     cmd = f"gcloud storage cp --recursive {local_dir} {remote_uri}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
+    res = run_with_progress(cmd, f"Persisting model parameters directly to GCS: {remote_uri}")
+    if res.returncode != 0:
         cmd = f"gsutil -m cp -r {local_dir} {remote_uri}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode == 0:
-        print0(f"Successfully verified permanent model state transfer to {remote_uri}")
-    else:
-        print0(f"Warning: Transfer hit invariant ({result.stderr})")
+        run_with_progress(cmd, f"Persisting parameters directly to GCS (gsutil fallback)")
 
 
-def sync_from_gcs(remote_uri, local_dir):
+def sync_from_gcs(remote_uri, local_dir, specific_step=-1):
     if remote_uri.startswith("gs://"):
         os.makedirs(local_dir, exist_ok=True)
-        print0(f"Loading checkpoint parameters directly from GCS Bucket: {remote_uri} ...")
-        cmd = f"gcloud storage cp --recursive '{remote_uri}/*' '{local_dir}/'"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if specific_step < 0:
+            cmd = f"gcloud storage ls '{remote_uri}/'"
+            r = run_with_progress(cmd, f"Searching remote GCS checkpointer: {remote_uri} for latest step")
+            if r.returncode != 0:
+                cmd = f"gsutil ls '{remote_uri}/'"
+                r = run_with_progress(cmd, f"Searching remote GCS checkpointer (gsutil fallback)")
+            
+            latest = -1
+            for line in r.stdout.split("\n"):
+                clean = line.strip().rstrip("/")
+                item = clean.split("/")[-1]
+                if item.isdigit():
+                    latest = max(latest, int(item))
+            if latest >= 0:
+                target_step = latest
+            else:
+                return # No checkpoint steps found
+        else:
+            target_step = specific_step
+
+        # Synchronize metadata root
+        subprocess.run(f"gcloud storage cp '{remote_uri}/_CHECKPOINT_METADATA' '{local_dir}/' 2>/dev/null", shell=True)
+        subprocess.run(f"gsutil cp '{remote_uri}/_CHECKPOINT_METADATA' '{local_dir}/' 2>/dev/null", shell=True)
+        
+        target_remote = f"{remote_uri}/{target_step}"
+        cmd = f"gcloud storage cp --recursive '{target_remote}' '{local_dir}/'"
+        res = run_with_progress(cmd, f"Pulling checkpoint step {target_step} parameters directly from GCS")
         if res.returncode != 0:
-            cmd = f"gsutil -m cp -r '{remote_uri}/*' '{local_dir}/'"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            cmd = f"gsutil -m cp -r '{target_remote}' '{local_dir}/'"
+            run_with_progress(cmd, f"Pulling checkpoint step {target_step} parameters (gsutil fallback)")
 
 
 def main():
@@ -116,14 +188,19 @@ def main():
     base_staging = f"/tmp/checkpoints/{args.load_model_tag}"
     remote_base = os.path.join(args.gcs_bucket, args.load_model_tag)
     if args.gcs_bucket.startswith("gs://"):
-        sync_from_gcs(remote_base, base_staging)
+        sync_from_gcs(remote_base, base_staging, specific_step=args.load_step)
 
     base_cm = CheckpointManager(base_staging)
-    if base_cm.latest_step() is not None:
+    
+    target_step = args.load_step if args.load_step >= 0 else base_cm.latest_step()
+    if target_step is not None:
         try:
             # Bind restored parameter PyTree directly into model
-            _, model, _, _ = base_cm.restore_latest(model=model)
-            print0(f"Restored base model weights directly from {remote_base}")
+            if args.load_step >= 0:
+                _, model, _, _ = base_cm.restore(target_step, model=model)
+            else:
+                _, model, _, _ = base_cm.restore_latest(model=model)
+            print0(f"Restored base model weights directly from {remote_base} step {target_step}")
         except ValueError as e:
             print0(f"Note: Dimension growth detected during checkpoint restore ({e}). Continuing fine-tuning with dynamically expanded vocabulary parameters.")
     else:
@@ -149,7 +226,7 @@ def main():
         opt_state.update(model, grads)
         return loss
 
-    conversations = get_mock_conversations()
+    conversations = load_sft_dataset(args.sft_dataset_path)
     bos_token = tokenizer.get_bos_token_id()
 
     print0(f"\n--- Starting Chat SFT for {args.num_iterations} iterations ---")
@@ -217,6 +294,10 @@ def main():
 
     sft_cm.close()
     print0(f"Completed SFT fine-tuning in {(time.time() - t0):.2f}s")
+
+    local_dataset_file = "/tmp/sft_dataset_staging.jsonl"
+    if os.path.exists(local_dataset_file):
+        os.remove(local_dataset_file)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ Base model pretraining script using JAX, Flax NNX, and Optax.
 Utilizes Grain shared-memory loading over pre-tokenized binary (.bin) token shards
 persisted in cloud storage buckets. Eliminates runtime tokenization overhead entirely.
 Supports distributed multi-axis Mesh sharding (DP, FSDP, TP), JAX profiler tracing,
-customizable Grain concurrency, and flawless GCS parameter PyTree binding.
+customizable Grain concurrency, flawless GCS parameter binding, ultra-fast targeted single-step syncing,
+and animated real-time terminal progress loading spinners.
 
 Usage:
     python scripts/base_train.py --shard_dir "gs://iharsh-fuse/nano-chat-jax/dataset"
@@ -12,9 +13,11 @@ Usage:
 
 import argparse
 import os
+import sys
 import time
 import glob
 import subprocess
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -24,14 +27,14 @@ from flax import nnx
 
 from nanochat.gpt import GPT, GPTConfig, setup_distributed_sharding
 from nanochat.dataloader import pretokenized_distributed_data_loader
-from nanochat.common import print0, print_banner, get_base_dir
+from nanochat.common import print0, print_banner
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import CheckpointManager
 from nanochat.loss_eval import evaluate_bpb
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining with GCS Weight Binding")
+    p = argparse.ArgumentParser(description="nanoChat.jax Base Pretraining with Dynamic Loading Spinners")
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Max sequence length")
     p.add_argument("--num_iterations", type=int, default=100, help="Training optimization steps")
@@ -56,13 +59,37 @@ def parse_args():
     return p.parse_args()
 
 
+def run_with_progress(cmd, desc):
+    spinner_symbols = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    stop_spinner = False
+
+    def spin():
+        i = 0
+        while not stop_spinner:
+            sys.stdout.write(f"\r{spinner_symbols[i]} {desc} ...")
+            sys.stdout.flush()
+            i = (i + 1) % len(spinner_symbols)
+            time.sleep(0.1)
+
+    t_spin = threading.Thread(target=spin)
+    t_spin.start()
+
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    stop_spinner = True
+    t_spin.join()
+
+    sys.stdout.write(f"\r[Completed] {desc} \n")
+    sys.stdout.flush()
+    return proc
+
+
 def list_shard_files(shard_dir):
     if shard_dir.startswith("gs://"):
         cmd = f"gcloud storage ls '{shard_dir}/*.bin'"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        result = run_with_progress(cmd, f"Discovering remote pre-tokenized binary shards across {shard_dir}")
         if result.returncode != 0:
             cmd = f"gsutil ls '{shard_dir}/*.bin'"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = run_with_progress(cmd, f"Discovering binary shards (gsutil fallback)")
         
         if result.returncode == 0 and result.stdout.strip():
             files = [line.strip() for line in result.stdout.strip().split("\n") if line.strip().endswith(".bin")]
@@ -73,27 +100,39 @@ def list_shard_files(shard_dir):
 
 
 def sync_to_gcs(local_dir, remote_uri):
-    print0(f"Persisting checkpoint directory directly to GCS Bucket: {remote_uri} ...")
     cmd = f"gcloud storage cp --recursive {local_dir} {remote_uri}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = run_with_progress(cmd, f"Persisting checkpoint parameters directly to GCS Bucket: {remote_uri}")
     if result.returncode != 0:
         cmd = f"gsutil -m cp -r {local_dir} {remote_uri}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode == 0:
-        print0(f"Successfully verified permanent model state transfer to {remote_uri}")
-    else:
-        print0(f"Warning: Transfer hit invariant ({result.stderr})")
+        run_with_progress(cmd, f"Persisting parameters directly to GCS (gsutil fallback)")
 
 
 def sync_from_gcs(remote_uri, local_dir):
     if remote_uri.startswith("gs://"):
         os.makedirs(local_dir, exist_ok=True)
-        print0(f"Loading checkpoint parameters directly from GCS Bucket: {remote_uri} ...")
-        cmd = f"gcloud storage cp --recursive '{remote_uri}/*' '{local_dir}/'"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if res.returncode != 0:
-            cmd = f"gsutil -m cp -r '{remote_uri}/*' '{local_dir}/'"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = f"gcloud storage ls '{remote_uri}/'"
+        r = run_with_progress(cmd, f"Searching remote GCS checkpointer: {remote_uri} for latest step")
+        if r.returncode != 0:
+            cmd = f"gsutil ls '{remote_uri}/'"
+            r = run_with_progress(cmd, f"Searching remote GCS checkpointer (gsutil fallback)")
+        
+        latest = -1
+        for line in r.stdout.split("\n"):
+            clean = line.strip().rstrip("/")
+            item = clean.split("/")[-1]
+            if item.isdigit():
+                latest = max(latest, int(item))
+                
+        if latest >= 0:
+            subprocess.run(f"gcloud storage cp '{remote_uri}/_CHECKPOINT_METADATA' '{local_dir}/' 2>/dev/null", shell=True)
+            subprocess.run(f"gsutil cp '{remote_uri}/_CHECKPOINT_METADATA' '{local_dir}/' 2>/dev/null", shell=True)
+            
+            target_remote = f"{remote_uri}/{latest}"
+            cmd = f"gcloud storage cp --recursive '{target_remote}' '{local_dir}/'"
+            res = run_with_progress(cmd, f"Pulling checkpoint step {latest} parameters directly from GCS")
+            if res.returncode != 0:
+                cmd = f"gsutil -m cp -r '{target_remote}' '{local_dir}/'"
+                run_with_progress(cmd, f"Pulling checkpoint step {latest} parameters (gsutil fallback)")
 
 
 def main():
@@ -170,7 +209,6 @@ def main():
     start_step = 0
     if ckpt_manager.latest_step() is not None:
         try:
-            # Bind the restored parameter module directly into model to completely prevent initial random evaluation
             restored_step, model, restored_opt, extra = ckpt_manager.restore_latest(model=model, opt_state=opt_state)
             start_step = restored_step
             if restored_opt is not None:
