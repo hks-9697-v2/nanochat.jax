@@ -13,6 +13,7 @@ dependencies = [
     "tokenizers",
     "psutil",
     "pytest",
+    "tokamax",
 ]
 
 [build-system]
