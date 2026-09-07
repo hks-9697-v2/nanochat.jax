@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
     p.add_argument("--shard_dir", type=str, default="gs://your-bucket-name/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
     p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/checkpoints/full-dataset-run", help="Direct GCS bucket string for model weight checkpoints")
+    p.add_argument("--checkpoint_dir", type=str, default="/tmp/checkpoints", help="Local directory to stage and save model checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
     p.add_argument("--ckpt_every", type=int, default=500, help="Step interval for asynchronous distributed checkpoint saving")
     p.add_argument("--eval_every", type=int, default=50, help="Evaluate validation BPB interval")
@@ -204,6 +205,7 @@ def main():
         tokamax_k_layout=args.tokamax_k_layout,
         tokamax_v_layout=args.tokamax_v_layout,
         tokamax_use_experimental_scheduler=args.tokamax_use_experimental_scheduler,
+        mesh=mesh,
     )
 
     with jax.set_mesh(mesh):
@@ -213,7 +215,7 @@ def main():
     total_params = sum(x.size for x in jax.tree.leaves(params))
     print0(f"Initialised GPT base model with {total_params:,} parameters")
 
-    staging_base = f"/tmp/checkpoints/{args.model_tag}"
+    staging_base = os.path.join(args.checkpoint_dir, args.model_tag)
     os.makedirs(staging_base, exist_ok=True)
 
     remote_dest = os.path.join(args.gcs_bucket, args.model_tag) if args.gcs_bucket.startswith("gs://") else os.path.join(args.gcs_bucket, args.model_tag)
@@ -255,12 +257,13 @@ def main():
         opt_state.update(model, grads)
         return loss
 
-    tokens_per_iter = args.device_batch_size * args.max_seq_len
+    global_batch_size = args.device_batch_size * args.dp * args.fsdp
+    tokens_per_iter = global_batch_size * args.max_seq_len
     grad_accum_steps = max(1, args.total_batch_size // tokens_per_iter)
     
-    print0(f"Initializing Grain MapDataset loader (Workers={args.grain_workers}, Pre-Buffer={args.grain_buffer_size})...")
+    print0(f"Initializing Grain MapDataset loader (Workers={args.grain_workers}, Pre-Buffer={args.grain_buffer_size}, GlobalBatch={global_batch_size})...")
     train_loader = pretokenized_distributed_data_loader(
-        args.device_batch_size, args.max_seq_len, split="train", shard_files=shard_files,
+        global_batch_size, args.max_seq_len, split="train", shard_files=shard_files,
         grain_workers=args.grain_workers, grain_buffer_size=args.grain_buffer_size
     )
 
@@ -297,11 +300,12 @@ def main():
             break
 
         step_start = time.time()
-        for _ in range(grad_accum_steps):
-            x = jax.device_put(jnp.asarray(x_np, dtype=jnp.int32), data_sharding)
-            y = jax.device_put(jnp.asarray(y_np, dtype=jnp.int32), data_sharding)
-            loss = train_step(model, opt_state, x, y)
-            x_np, y_np = next(train_loader)
+        with jax.set_mesh(mesh):
+            for _ in range(grad_accum_steps):
+                x = jax.device_put(jnp.asarray(x_np, dtype=jnp.int32), data_sharding)
+                y = jax.device_put(jnp.asarray(y_np, dtype=jnp.int32), data_sharding)
+                loss = train_step(model, opt_state, x, y)
+                x_np, y_np = next(train_loader)
         
         jax.block_until_ready(loss)
         step_dt = time.time() - step_start

@@ -12,6 +12,7 @@ Notable features:
 """
 
 from dataclasses import dataclass
+from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -42,6 +43,8 @@ class GPTConfig:
     tokamax_k_layout: str | None = None
     tokamax_v_layout: str | None = None
     tokamax_use_experimental_scheduler: bool | None = None
+    mesh: Any = None
+    q_sharding: Any = None
 
 
 def _is_tpu_device():
@@ -238,6 +241,41 @@ class CausalSelfAttention(nnx.Module):
             k_t = jnp.transpose(k, (0, 2, 1, 3))
             v_t = jnp.transpose(v, (0, 2, 1, 3))
 
+            # Derive q_sharding if running across a distributed multi-device mesh
+            q_shd = getattr(self.config, "q_sharding", None)
+            if q_shd is None:
+                m = getattr(self.config, "mesh", None)
+                if m is None:
+                    try:
+                        abs_m = jax.sharding.get_abstract_mesh()
+                        if not abs_m.empty:
+                            m = abs_m
+                    except Exception:
+                        m = None
+                if m is not None and len(m.axis_names) > 0:
+                    axis_names = m.axis_names
+                    if "dp" in axis_names and "fsdp" in axis_names:
+                        data_axis = ("dp", "fsdp")
+                    elif "fsdp" in axis_names:
+                        data_axis = "fsdp"
+                    elif "dp" in axis_names:
+                        data_axis = "dp"
+                    else:
+                        data_axis = axis_names[0]
+                    
+                    mesh_shape = dict(m.shape)
+                    num_data_devices = 1
+                    if isinstance(data_axis, tuple):
+                        for a in data_axis:
+                            num_data_devices *= mesh_shape.get(a, 1)
+                    else:
+                        num_data_devices = mesh_shape.get(data_axis, 1)
+                    
+                    if num_data_devices > 1:
+                        q_shd = jax.sharding.NamedSharding(
+                            m, jax.sharding.PartitionSpec(data_axis, None, None, None)
+                        )
+
             if kv_cache is None or Tq == Tk:
                 # Full causal attention (training or prompt evaluation)
                 if (Tq % 128 == 0) and _is_tpu_device():
@@ -245,7 +283,7 @@ class CausalSelfAttention(nnx.Module):
                 else:
                     impl = "xla" if (Tq % 128 != 0) else None
                 y = tokamax.dot_product_attention(
-                    q_t, k_t, v_t, scale=scale, is_causal=True, implementation=impl
+                    q_t, k_t, v_t, scale=scale, is_causal=True, implementation=impl, q_sharding=q_shd
                 )
             elif Tq == 1:
                 # Single-token autoregressive generation against past KV cache

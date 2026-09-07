@@ -154,72 +154,24 @@ Combine any parallelism configuration seamlessly via command line flags:
 
 ## Hardware-Accelerated Attention Kernels (Tokamax Support)
 
-nanoChat.jax supports configurable attention kernels across all training and evaluation scripts via the `--attention_kernel` argument:
+nanoChat.jax supports hardware-accelerated FlashAttention via **Tokamax** (`--attention_kernel tokamax`), lowering to Pallas / Mosaic Splash Attention on TPUs and Triton / CuDNN on GPUs. This reduces attention memory from $O(T^2)$ to $O(T)$ and achieves up to **2.80x isolated attention speedup** and **1.16x end-to-end pretraining throughput**.
 
-- `--attention_kernel standard`: Default pure JAX einsum attention with causal masking. Compatible across all hardware backends.
-- `--attention_kernel tokamax`: Utilizes **Tokamax** (`tokamax.dot_product_attention`) to execute fused hardware-accelerated FlashAttention (via Pallas / Mosaic on TPUs and Triton/CuDNN on GPUs). Reduces attention memory from $O(T^2)$ down to linear $O(T)$ and significantly accelerates long-context pretraining and fine-tuning.
+- **Tuning Modes**: `--tokamax_tune_mode auto|tokamax_default|custom` (optimal tuned tile configs on TPU v7x).
+- **Custom Block Size Overrides**: Granular CLI flags for `--tokamax_block_q`, `--tokamax_block_kv`, compute chunk sizes, and memory layouts.
+- **Distributed Auto-Sharding**: Automatic `q_sharding` derivation across `dp * fsdp` device meshes for Pallas Mosaic SPMD execution.
 
-### Kernel Tuning & Configuration Options
+👉 **For complete details on custom block sizing, tuning options, and benchmarks, see [`docs/attention_kernels.md`](docs/attention_kernels.md).**
 
-On TPUs, Tokamax maps to Pallas Mosaic Splash Attention. By default, nanoChat.jax applies **optimal tuned tile configurations** discovered via benchmarking on TPU v7x, but you can freely switch back to Tokamax defaults or provide custom overrides:
+---
 
-- `--tokamax_tune_mode auto` (**Default**): Uses optimal tuned block sizes and layouts discovered on hardware:
-  - **$T \le 1024$**: `block_q=1024, block_kv=1024, block_kv_compute=512`, backward `1024/1024/1024`, layout `SEQ_MINOR`.
-  - **$T \ge 2048$**: `block_q=512, block_kv=2048, block_kv_compute=2048`, backward `1024/2048/1024`, layout `HEAD_DIM_MINOR`, scheduler enabled.
-- `--tokamax_tune_mode tokamax_default`: Uses Tokamax's un-tuned default heuristics (`block_q=128, block_kv=128, block_kv_compute=128`).
-- `--tokamax_tune_mode custom`: Apply specific custom tile sizes and layouts using the override flags below.
+## Automated Nemotron-3 Ultra Pipelines
 
-#### Granular Tile & Layout Overrides
-You can override any individual parameter from the command line:
-- `--tokamax_block_q <INT>`: Forward query tile size (must be divisible by 128)
-- `--tokamax_block_kv <INT>`: Forward key/value tile size
-- `--tokamax_block_kv_compute <INT>`: Forward KV compute chunk size
-- `--tokamax_block_q_dkv <INT>`: Backward query tile size
-- `--tokamax_block_kv_dkv <INT>`: Backward key/value tile size
-- `--tokamax_block_kv_dkv_compute <INT>`: Backward KV compute chunk size
-- `--tokamax_q_layout <head_dim_minor|seq_minor>`: Query memory layout
-- `--tokamax_k_layout <head_dim_minor|seq_minor>`: Key memory layout
-- `--tokamax_v_layout <head_dim_minor|seq_minor>`: Value memory layout
-- `--tokamax_use_experimental_scheduler <True|False>`: Pallas experimental warp scheduler
+nanoChat.jax includes dedicated end-to-end automation scripts to stream, tokenize, and train on the **NVIDIA Nemotron-3 Ultra dataset** ([`nvidia/Nemotron-RL-Ultra-Training-Blends`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Ultra-Training-Blends)):
 
-### CLI Usage Examples
+- **Base Pretraining Pipeline** ([`scripts/run_nemotron_pretrain.py`](scripts/run_nemotron_pretrain.py)): Streams dataset subsets (`reasoning`, `mopd`, `ifbench`, `swe`, `rlhf`), pre-tokenizes documents into compressed binary `.bin` shards, and executes distributed pretraining with Tokamax FlashAttention.
+- **Chat SFT Fine-Tuning Pipeline** ([`scripts/run_nemotron_sft.py`](scripts/run_nemotron_sft.py)): Normalizes multi-turn conversations into strictly alternating turns, creates formatted SFT JSONLines (`nemotron_sft.jsonl`), restores base checkpoints, and runs distributed Chat SFT with ChatML token masking.
 
-```bash
-# 1. Base pretraining using Tokamax FlashAttention with tuned defaults (fastest):
-python scripts/base_train.py \
-    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
-    --attention_kernel tokamax \
-    --max_seq_len 1024 \
-    --device_batch_size 4
-
-# 2. Base pretraining using Tokamax built-in default heuristics (untuned):
-python scripts/base_train.py \
-    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
-    --attention_kernel tokamax \
-    --tokamax_tune_mode tokamax_default \
-    --max_seq_len 1024
-
-# 3. Custom tile overrides:
-python scripts/base_train.py \
-    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
-    --attention_kernel tokamax \
-    --tokamax_tune_mode custom \
-    --tokamax_block_q 512 \
-    --tokamax_block_kv 1024 \
-    --tokamax_block_kv_compute 512
-
-# 4. Chat SFT fine-tuning with Tokamax:
-python scripts/chat_sft.py \
-    --sft_dataset_path "$NANOCHAT_STORAGE_ROOT/sft_dataset/sft_conversations.jsonl" \
-    --attention_kernel tokamax \
-    --load_model_tag base_trained_gpt2_full
-
-# 5. Interactive CLI generation with Tokamax:
-python scripts/chat_cli.py \
-    --attention_kernel tokamax \
-    --load_model_tag final_sft_model \
-    --prompt "What is the capital of France?"
-```
+👉 **For full pipeline documentation, execution modes, and arguments, see [`docs/nemotron_training.md`](docs/nemotron_training.md).**
 
 ---
 
@@ -230,3 +182,4 @@ Run the local pytest suite to verify structural components, loss functions, dist
 ```bash
 pytest tests/ -v
 ```
+

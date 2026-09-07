@@ -41,6 +41,7 @@ def parse_args():
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
     p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/nano-chat-jax/checkpoints/full-dataset-run", help="GCS bucket for model checkpoints")
+    p.add_argument("--checkpoint_dir", type=str, default="/tmp/checkpoints", help="Local directory to stage and save model checkpoints")
     p.add_argument("--sft_dataset_path", type=str, default="gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl", help="Path to SFT dataset file (.jsonl)")
     p.add_argument("--load_model_tag", type=str, default="base_trained_gpt2_full", help="Checkpointed base model to load")
     p.add_argument("--save_model_tag", type=str, default="final_sft_model", help="Destination tag for SFT model")
@@ -204,12 +205,13 @@ def main():
         tokamax_k_layout=args.tokamax_k_layout,
         tokamax_v_layout=args.tokamax_v_layout,
         tokamax_use_experimental_scheduler=args.tokamax_use_experimental_scheduler,
+        mesh=mesh,
     )
 
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
 
-    base_staging = f"/tmp/checkpoints/{args.load_model_tag}"
+    base_staging = os.path.join(args.checkpoint_dir, args.load_model_tag)
     remote_base = os.path.join(args.gcs_bucket, args.load_model_tag)
     if args.gcs_bucket.startswith("gs://"):
         sync_from_gcs(remote_base, base_staging, specific_step=args.load_step)
@@ -230,7 +232,7 @@ def main():
     else:
         print0("No base checkpoint found; initialising from scratch for SFT.")
 
-    sft_staging = f"/tmp/checkpoints/{args.save_model_tag}"
+    sft_staging = os.path.join(args.checkpoint_dir, args.save_model_tag)
     os.makedirs(sft_staging, exist_ok=True)
     remote_sft = os.path.join(args.gcs_bucket, args.save_model_tag)
     if args.gcs_bucket.startswith("gs://"):
@@ -284,9 +286,10 @@ def main():
                 sync_to_gcs(f"{sft_staging}/*", remote_sft)
             break
 
+        global_batch_size = args.device_batch_size * args.dp * args.fsdp
         x_rows, y_rows = [], []
-        for b in range(args.device_batch_size):
-            conv = conversations[(step * args.device_batch_size + b) % len(conversations)]
+        for b in range(global_batch_size):
+            conv = conversations[(step * global_batch_size + b) % len(conversations)]
             ids, mask = tokenizer.render_conversation(conv, max_tokens=args.max_seq_len + 1)
             
             pad_len = (args.max_seq_len + 1) - len(ids)
@@ -309,8 +312,9 @@ def main():
         y = jax.device_put(jnp.array(y_rows, dtype=jnp.int32), data_sharding)
 
         step_t0 = time.time()
-        loss = sft_step(model, opt_state, x, y)
-        jax.block_until_ready(loss)
+        with jax.set_mesh(mesh):
+            loss = sft_step(model, opt_state, x, y)
+            jax.block_until_ready(loss)
         dt = time.time() - step_t0
 
         if step % 10 == 0 or step == args.num_iterations - 1 or (args.profile_start <= step < args.profile_end):
