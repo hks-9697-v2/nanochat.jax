@@ -26,6 +26,126 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    attention_kernel: str = "standard" # "standard" (einsum) or "tokamax" (hardware-accelerated flash attention)
+    # Tokamax tuning options:
+    # "auto" (default): use optimal tuned splash attention block sizes and layouts discovered on TPU
+    # "tokamax_default": use Tokamax's original built-in default heuristics (e.g. block_q=128)
+    # "custom": use user-specified overrides below
+    tokamax_tune_mode: str = "auto"
+    tokamax_block_q: int | None = None
+    tokamax_block_kv: int | None = None
+    tokamax_block_kv_compute: int | None = None
+    tokamax_block_q_dkv: int | None = None
+    tokamax_block_kv_dkv: int | None = None
+    tokamax_block_kv_dkv_compute: int | None = None
+    tokamax_q_layout: str | None = None # "head_dim_minor" or "seq_minor"
+    tokamax_k_layout: str | None = None
+    tokamax_v_layout: str | None = None
+    tokamax_use_experimental_scheduler: bool | None = None
+
+
+def _is_tpu_device():
+    try:
+        import jax
+        return any(d.platform == "tpu" for d in jax.devices())
+    except Exception:
+        return False
+
+
+def _parse_qkv_layout(layout_val, default_layout):
+    if layout_val is None:
+        return default_layout
+    if isinstance(layout_val, str):
+        layout_str = layout_val.lower()
+        from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+        if layout_str in ("head_dim_minor", "1"):
+            return splash.QKVLayout.HEAD_DIM_MINOR
+        elif layout_str in ("seq_minor", "2"):
+            return splash.QKVLayout.SEQ_MINOR
+    return layout_val
+
+
+def get_tokamax_tpu_implementation(config: GPTConfig, seq_len: int):
+    """Returns configured PallasMosaicTpuFlashAttention with tuned or overridden parameters.
+
+    - If tokamax_tune_mode == 'tokamax_default', returns None (using Tokamax's original 128-tile heuristics).
+    - If tokamax_tune_mode is 'auto' (default) or 'custom', applies optimal tuned configurations
+      discovered via splash_attention_benchmarking, and allows individual parameter overrides.
+    """
+    mode = getattr(config, "tokamax_tune_mode", "auto")
+    if mode == "tokamax_default":
+        return None
+
+    try:
+        from tokamax._src.ops.attention import pallas_mosaic_tpu, pallas_mosaic_tpu_vjp
+        from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+    except ImportError:
+        return None
+
+    # Base tuned defaults from splash_attention_benchmarking on TPU v7x
+    if seq_len <= 1024:
+        bq = 1024 if seq_len >= 1024 else seq_len
+        bkv = 1024 if seq_len >= 1024 else seq_len
+        bkv_c = 512 if seq_len >= 512 else seq_len
+        bq_dkv = 1024 if seq_len >= 1024 else seq_len
+        bkv_dkv = 1024 if seq_len >= 1024 else seq_len
+        bkv_dkv_c = 1024 if seq_len >= 1024 else seq_len
+        ql = splash.QKVLayout.SEQ_MINOR
+        kl = splash.QKVLayout.SEQ_MINOR
+        vl = splash.QKVLayout.SEQ_MINOR
+        sched = False
+    else:
+        bq = 512
+        bkv = min(seq_len, 2048)
+        bkv_c = min(seq_len, 2048)
+        bq_dkv = min(seq_len, 1024)
+        bkv_dkv = min(seq_len, 2048)
+        bkv_dkv_c = min(seq_len, 1024)
+        ql = splash.QKVLayout.HEAD_DIM_MINOR
+        kl = splash.QKVLayout.HEAD_DIM_MINOR
+        vl = splash.QKVLayout.HEAD_DIM_MINOR
+        sched = True
+
+    # Apply any explicit config overrides
+    if getattr(config, "tokamax_block_q", None) is not None:
+        bq = config.tokamax_block_q
+    if getattr(config, "tokamax_block_kv", None) is not None:
+        bkv = config.tokamax_block_kv
+    if getattr(config, "tokamax_block_kv_compute", None) is not None:
+        bkv_c = config.tokamax_block_kv_compute
+    if getattr(config, "tokamax_block_q_dkv", None) is not None:
+        bq_dkv = config.tokamax_block_q_dkv
+    if getattr(config, "tokamax_block_kv_dkv", None) is not None:
+        bkv_dkv = config.tokamax_block_kv_dkv
+    if getattr(config, "tokamax_block_kv_dkv_compute", None) is not None:
+        bkv_dkv_c = config.tokamax_block_kv_dkv_compute
+    if getattr(config, "tokamax_q_layout", None) is not None:
+        ql = _parse_qkv_layout(config.tokamax_q_layout, ql)
+    if getattr(config, "tokamax_k_layout", None) is not None:
+        kl = _parse_qkv_layout(config.tokamax_k_layout, kl)
+    if getattr(config, "tokamax_v_layout", None) is not None:
+        vl = _parse_qkv_layout(config.tokamax_v_layout, vl)
+    if getattr(config, "tokamax_use_experimental_scheduler", None) is not None:
+        sched = config.tokamax_use_experimental_scheduler
+
+    fwd_cfg = pallas_mosaic_tpu.Config(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv_c,
+        q_layout=ql,
+        k_layout=kl,
+        v_layout=vl,
+        use_experimental_scheduler=sched,
+        use_base2_exp=True,
+    )
+    bwd_cfg = pallas_mosaic_tpu_vjp.Config(
+        block_q_dkv=bq_dkv,
+        block_kv_dkv=bkv_dkv,
+        block_kv_dkv_compute=bkv_dkv_c,
+        use_base2_exp=True,
+    )
+    vjp = pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp().replace(config=bwd_cfg)
+    return pallas_mosaic_tpu.PallasMosaicTpuFlashAttention(vjp=vjp).replace(config=fwd_cfg)
 
 
 def norm(x):
@@ -57,6 +177,8 @@ class CausalSelfAttention(nnx.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        self.config = config
+        self.attention_kernel = getattr(config, "attention_kernel", "standard")
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
@@ -95,28 +217,72 @@ class CausalSelfAttention(nnx.Module):
         k = repeat_kv(k, nrep)
         v = repeat_kv(v, nrep)
 
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        scale = 1.0 / jnp.sqrt(self.head_dim)
-        att = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+        scale = float(1.0 / (self.head_dim ** 0.5))
 
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            mask = jnp.tril(jnp.ones((Tq, Tk), dtype=bool))[None, None, :, :]
-            att = jnp.where(mask, att, -jnp.inf)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            pass
+        if self.attention_kernel == "tokamax":
+            try:
+                import tokamax
+                try:
+                    from absl import flags
+                    if not flags.FLAGS.is_parsed():
+                        flags.FLAGS.mark_as_parsed()
+                except Exception:
+                    pass
+            except ImportError as e:
+                raise ImportError(
+                    "tokamax is required when attention_kernel='tokamax'. Please install tokamax."
+                ) from e
+
+            # tokamax.dot_product_attention expects inputs of shape (*B, T, N, H)
+            q_t = jnp.transpose(q, (0, 2, 1, 3))
+            k_t = jnp.transpose(k, (0, 2, 1, 3))
+            v_t = jnp.transpose(v, (0, 2, 1, 3))
+
+            if kv_cache is None or Tq == Tk:
+                # Full causal attention (training or prompt evaluation)
+                if (Tq % 128 == 0) and _is_tpu_device():
+                    impl = get_tokamax_tpu_implementation(self.config, Tq)
+                else:
+                    impl = "xla" if (Tq % 128 != 0) else None
+                y = tokamax.dot_product_attention(
+                    q_t, k_t, v_t, scale=scale, is_causal=True, implementation=impl
+                )
+            elif Tq == 1:
+                # Single-token autoregressive generation against past KV cache
+                y = tokamax.dot_product_attention(
+                    q_t, k_t, v_t, scale=scale, is_causal=False, implementation="xla"
+                )
+            else:
+                # Chunked generation
+                prefix_len = Tk - Tq
+                mask = (jnp.arange(Tk)[None, :] <= (jnp.arange(Tq)[:, None] + prefix_len))[None, None, :, :]
+                y = tokamax.dot_product_attention(
+                    q_t, k_t, v_t, mask=mask, scale=scale, implementation="xla"
+                )
+            y = y.reshape(B, Tq, -1)
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            prefix_len = Tk - Tq
-            mask = (jnp.arange(Tk)[None, :] <= (jnp.arange(Tq)[:, None] + prefix_len))[None, None, :, :]
-            att = jnp.where(mask, att, -jnp.inf)
+            # Attention: queries attend to keys/values autoregressively. A few cases to handle:
+            att = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
 
-        att = jax.nn.softmax(att, axis=-1)
-        y = jnp.einsum('bhqk,bhkd->bhqd', att, v)
+            if kv_cache is None or Tq == Tk:
+                # During training (no KV cache), attend as usual with causal attention
+                mask = jnp.tril(jnp.ones((Tq, Tk), dtype=bool))[None, None, :, :]
+                att = jnp.where(mask, att, -jnp.inf)
+            elif Tq == 1:
+                # During inference but with a single query in this forward pass:
+                pass
+            else:
+                # During inference AND we have a chunk of queries in this forward pass:
+                prefix_len = Tk - Tq
+                mask = (jnp.arange(Tk)[None, :] <= (jnp.arange(Tq)[:, None] + prefix_len))[None, None, :, :]
+                att = jnp.where(mask, att, -jnp.inf)
 
-        # Re-assemble the heads side by side and project back to residual stream
-        y = jnp.transpose(y, (0, 2, 1, 3)).reshape(B, T, -1)
+            att = jax.nn.softmax(att, axis=-1)
+            y = jnp.einsum('bhqk,bhkd->bhqd', att, v)
+
+            # Re-assemble the heads side by side and project back to residual stream
+            y = jnp.transpose(y, (0, 2, 1, 3)).reshape(B, T, -1)
+
         y = self.c_proj(y)
         return y
     

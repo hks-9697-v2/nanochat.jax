@@ -50,6 +50,18 @@ def parse_args():
     # Output
     p.add_argument("--model_tag", type=str, default="", help="Override checkpoint dir name")
     p.add_argument("--max_to_keep", type=int, default=3, help="Checkpoints to keep")
+    p.add_argument("--attention_kernel", type=str, default="standard", choices=["standard", "tokamax"], help="Attention kernel: 'standard' (einsum) or 'tokamax' (hardware-accelerated flash attention)")
+    p.add_argument("--tokamax_tune_mode", type=str, default="auto", choices=["auto", "tokamax_default", "custom"], help="Tokamax tuning mode: 'auto' (tuned defaults), 'tokamax_default' (Tokamax built-in heuristics), or 'custom'")
+    p.add_argument("--tokamax_block_q", type=int, default=None, help="Tokamax block_q override")
+    p.add_argument("--tokamax_block_kv", type=int, default=None, help="Tokamax block_kv override")
+    p.add_argument("--tokamax_block_kv_compute", type=int, default=None, help="Tokamax block_kv_compute override")
+    p.add_argument("--tokamax_block_q_dkv", type=int, default=None, help="Tokamax block_q_dkv override")
+    p.add_argument("--tokamax_block_kv_dkv", type=int, default=None, help="Tokamax block_kv_dkv override")
+    p.add_argument("--tokamax_block_kv_dkv_compute", type=int, default=None, help="Tokamax block_kv_dkv_compute override")
+    p.add_argument("--tokamax_q_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax q layout override")
+    p.add_argument("--tokamax_k_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax k layout override")
+    p.add_argument("--tokamax_v_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax v layout override")
+    p.add_argument("--tokamax_use_experimental_scheduler", type=lambda x: (str(x).lower() == 'true'), default=None, help="Tokamax scheduler override (True/False)")
     return p.parse_args()
 
 
@@ -94,6 +106,18 @@ model_config = GPTConfig(
     n_head=num_heads,
     n_kv_head=num_kv_heads,
     n_embd=model_dim,
+    attention_kernel=args.attention_kernel,
+    tokamax_tune_mode=args.tokamax_tune_mode,
+    tokamax_block_q=args.tokamax_block_q,
+    tokamax_block_kv=args.tokamax_block_kv,
+    tokamax_block_kv_compute=args.tokamax_block_kv_compute,
+    tokamax_block_q_dkv=args.tokamax_block_q_dkv,
+    tokamax_block_kv_dkv=args.tokamax_block_kv_dkv,
+    tokamax_block_kv_dkv_compute=args.tokamax_block_kv_dkv_compute,
+    tokamax_q_layout=args.tokamax_q_layout,
+    tokamax_k_layout=args.tokamax_k_layout,
+    tokamax_v_layout=args.tokamax_v_layout,
+    tokamax_use_experimental_scheduler=args.tokamax_use_experimental_scheduler,
 )
 model = GPT(model_config, rngs=nnx.Rngs(0))
 
