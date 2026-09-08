@@ -19,6 +19,9 @@ Usage:
 """
 
 import argparse
+import ast
+import glob
+import json
 import os
 import sys
 import subprocess
@@ -41,7 +44,7 @@ def parse_args():
     p.add_argument(
         "--configs",
         type=str,
-        default="reasoning,mopd,ifbench,swe,rlhf",
+        default="rlvr1,rlvr2,mopd,ifbench,reasoning,rlhf",
         help="Comma-separated subset configurations to process from the dataset",
     )
     p.add_argument("--split", type=str, default="train", help="Dataset split to stream")
@@ -54,13 +57,19 @@ def parse_args():
     p.add_argument(
         "--max_docs",
         type=int,
-        default=25000,
-        help="Maximum document count to process (-1 = unlimited)",
+        default=-1,
+        help="Maximum document count to process (-1 = unlimited, controlled by target_tokens)",
+    )
+    p.add_argument(
+        "--target_tokens",
+        type=int,
+        default=3000000000,
+        help="Target total tokens to prepare for pretraining",
     )
     p.add_argument(
         "--shard_size",
         type=int,
-        default=1000000,
+        default=10000000,
         help="Number of tokens per binary shard (.bin)",
     )
     p.add_argument(
@@ -77,10 +86,10 @@ def parse_args():
     # Pretraining hyperparameters
     p.add_argument("--depth", type=int, default=12, help="Transformer depth")
     p.add_argument("--max_seq_len", type=int, default=1024, help="Context length")
-    p.add_argument("--num_iterations", type=int, default=200, help="Pretraining optimization steps")
-    p.add_argument("--device_batch_size", type=int, default=4, help="Per-device batch size")
-    p.add_argument("--total_batch_size", type=int, default=32768, help="Total effective token batch size")
-    p.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate")
+    p.add_argument("--num_iterations", type=int, default=5722, help="Pretraining optimization steps")
+    p.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size")
+    p.add_argument("--total_batch_size", type=int, default=524288, help="Total effective token batch size")
+    p.add_argument("--learning_rate", type=float, default=6e-4, help="Peak learning rate")
     p.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay")
     p.add_argument(
         "--checkpoint_dir",
@@ -91,15 +100,21 @@ def parse_args():
     p.add_argument(
         "--model_tag",
         type=str,
-        default="nemotron-base-run",
+        default="nemotron-base-3b",
         help="Tag name for base model checkpoints",
     )
-    p.add_argument("--ckpt_every", type=int, default=100, help="Checkpoint interval")
-    p.add_argument("--eval_every", type=int, default=50, help="Validation BPB eval interval")
+    p.add_argument("--ckpt_every", type=int, default=500, help="Checkpoint interval")
+    p.add_argument("--eval_every", type=int, default=250, help="Validation BPB eval interval")
+    p.add_argument(
+        "--metrics_json_path",
+        type=str,
+        default="/mnt/v7x8-disk/iharsh_workspace/results/pretrain_metrics.json",
+        help="Destination JSON path for step-by-step performance and loss metrics",
+    )
 
     # Distributed Sharding
-    p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
-    p.add_argument("--fsdp", type=int, default=8, help="FSDP sharding degree")
+    p.add_argument("--dp", type=int, default=8, help="Data parallelism degree")
+    p.add_argument("--fsdp", type=int, default=1, help="FSDP sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
 
     # Attention Kernel & Tuning
@@ -123,8 +138,19 @@ def parse_args():
 def extract_raw_text(row):
     """Extracts raw textual training content from various Nemotron schema types."""
     messages = []
-    rcp = row.get("responses_create_params") or {}
-    if isinstance(rcp, dict) and "input" in rcp and isinstance(rcp["input"], list):
+    rcp = row.get("responses_create_params")
+    if isinstance(rcp, str):
+        try:
+            rcp = ast.literal_eval(rcp)
+        except Exception:
+            try:
+                rcp = json.loads(rcp)
+            except Exception:
+                rcp = {}
+    if not isinstance(rcp, dict):
+        rcp = {}
+
+    if "input" in rcp and isinstance(rcp["input"], list):
         for msg in rcp["input"]:
             if isinstance(msg, dict) and "role" in msg and "content" in msg:
                 messages.append(f"{msg['role']}: {msg['content']}")
@@ -164,42 +190,71 @@ def prepare_nemotron_shards(args):
     print0(f"Target shard directory: {args.data_dir}")
     os.makedirs(args.data_dir, exist_ok=True)
 
+    existing_shards = sorted(glob.glob(os.path.join(args.data_dir, "*.bin")))
+    if existing_shards:
+        existing_tokens = 0
+        for s in existing_shards:
+            try:
+                if os.path.getsize(s) >= 1024:
+                    existing_tokens += int(np.fromfile(s, dtype=np.int32, count=3)[2])
+            except Exception:
+                pass
+        print0(f"Found {len(existing_shards)} existing shards containing {existing_tokens:,} tokens in {args.data_dir}")
+        if args.target_tokens > 0 and existing_tokens >= args.target_tokens:
+            print0(f"Target token budget ({args.target_tokens:,}) already fulfilled. Skipping data prep.")
+            return
+
     tokenizer = get_tokenizer()
     bos_token = tokenizer.get_bos_token_id()
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
 
     tokens_buffer = []
-    shard_idx = 0
+    shard_idx = len(existing_shards)
     total_docs = 0
     total_tokens = 0
 
-    pbar = tqdm(total=args.max_docs if args.max_docs > 0 else None, desc="Processing Nemotron Documents", unit="docs")
+    pbar = tqdm(total=args.target_tokens if args.target_tokens > 0 else None, desc="Processing Nemotron Tokens", unit="tokens")
 
     for cfg in configs:
+        if args.target_tokens > 0 and total_tokens >= args.target_tokens:
+            break
         if args.max_docs > 0 and total_docs >= args.max_docs:
             break
-        print0(f"\nStreaming config '{cfg}' from {args.dataset_name} ...")
+        print0(f"\nProcessing config '{cfg}' from {args.dataset_name} ...")
         try:
-            ds = load_dataset(args.dataset_name, cfg, split=args.split, streaming=True)
-            for row in ds:
-                if args.max_docs > 0 and total_docs >= args.max_docs:
-                    break
-                text = extract_raw_text(row)
-                if not text:
-                    continue
+            from huggingface_hub import hf_hub_download
+            fpath = hf_hub_download(args.dataset_name, f"{cfg}.jsonl", repo_type="dataset")
+            print0(f"Streaming from local file: {fpath}")
+            with open(fpath, "r", encoding="utf-8") as f_in:
+                for line in f_in:
+                    if args.target_tokens > 0 and total_tokens >= args.target_tokens:
+                        break
+                    if args.max_docs > 0 and total_docs >= args.max_docs:
+                        break
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        row = json.loads(line_str)
+                    except Exception:
+                        continue
 
-                ids = tokenizer.encode(text, prepend=bos_token)
-                tokens_buffer.extend(ids)
-                total_docs += 1
-                total_tokens += len(ids)
-                pbar.update(1)
+                    text = extract_raw_text(row)
+                    if not text:
+                        continue
 
-                # Flush shard when buffer exceeds target shard_size
-                if len(tokens_buffer) >= args.shard_size:
-                    shard_file = os.path.join(args.data_dir, f"dataset_shard_{shard_idx:05d}.bin")
-                    write_shard(shard_file, tokens_buffer[:args.shard_size])
-                    tokens_buffer = tokens_buffer[args.shard_size:]
-                    shard_idx += 1
+                    ids = tokenizer.encode(text, prepend=bos_token)
+                    tokens_buffer.extend(ids)
+                    total_docs += 1
+                    total_tokens += len(ids)
+                    pbar.update(len(ids))
+
+                    # Flush shard when buffer exceeds target shard_size
+                    if len(tokens_buffer) >= args.shard_size:
+                        shard_file = os.path.join(args.data_dir, f"dataset_shard_{shard_idx:05d}.bin")
+                        write_shard(shard_file, tokens_buffer[:args.shard_size])
+                        tokens_buffer = tokens_buffer[args.shard_size:]
+                        shard_idx += 1
 
         except Exception as e:
             print0(f"Warning: Failed to process config '{cfg}': {e}")
@@ -241,6 +296,7 @@ def run_pretraining(args):
         f"--dp={args.dp}",
         f"--fsdp={args.fsdp}",
         f"--tp={args.tp}",
+        f"--metrics_json_path={args.metrics_json_path}",
     ]
 
     print0(f"Executing: {' '.join(cmd)}\n")

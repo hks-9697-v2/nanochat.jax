@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import glob
+import json
 import subprocess
 import threading
 
@@ -52,7 +53,7 @@ def parse_args():
     p.add_argument("--fsdp", type=int, default=1, help="FSDP / ZeRO sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
     p.add_argument("--shard_dir", type=str, default="gs://your-bucket-name/dataset_tokens", help="Cloud storage directory containing pre-tokenized .bin shards")
-    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/checkpoints/full-dataset-run", help="Direct GCS bucket string for model weight checkpoints")
+    p.add_argument("--gcs_bucket", type=str, default="", help="Direct GCS bucket string for model weight checkpoints (optional)")
     p.add_argument("--checkpoint_dir", type=str, default="/tmp/checkpoints", help="Local directory to stage and save model checkpoints")
     p.add_argument("--model_tag", type=str, default="gpt2-pretokenized-run", help="Model checkpoint save tag")
     p.add_argument("--ckpt_every", type=int, default=500, help="Step interval for asynchronous distributed checkpoint saving")
@@ -75,6 +76,7 @@ def parse_args():
     p.add_argument("--tokamax_k_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax k layout override")
     p.add_argument("--tokamax_v_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax v layout override")
     p.add_argument("--tokamax_use_experimental_scheduler", type=lambda x: (str(x).lower() == 'true'), default=None, help="Tokamax scheduler override (True/False)")
+    p.add_argument("--metrics_json_path", type=str, default=None, help="File path to save training metrics JSON")
     return p.parse_args()
 
 
@@ -268,6 +270,14 @@ def main():
     )
 
     print0(f"\n--- Commencing Instant Base Pretraining (Steps {start_step} -> {args.num_iterations}) ---")
+    metrics_history = []
+    if args.metrics_json_path and os.path.exists(args.metrics_json_path):
+        try:
+            with open(args.metrics_json_path, "r") as f:
+                metrics_history = json.load(f)
+        except Exception:
+            metrics_history = []
+
     start_time = time.time()
     x_np, y_np = next(train_loader)
 
@@ -312,9 +322,35 @@ def main():
         tok_per_sec = int((tokens_per_iter * grad_accum_steps) / step_dt) if step_dt > 0 else 0
 
         if step % 10 == 0 or step == args.num_iterations - 1 or (args.profile_start <= step < args.profile_end):
-            print0(f"Step {step:05d}/{args.num_iterations:05d} | Loss: {loss.item():.4f} | Throughput: {tok_per_sec:,} tok/s")
+            step_loss = float(loss.item())
+            ppl = float(np.exp(min(step_loss, 20.0)))
+            print0(f"Step {step:05d}/{args.num_iterations:05d} | Loss: {step_loss:.4f} | PPL: {ppl:.2f} | Throughput: {tok_per_sec:,} tok/s")
+            if args.metrics_json_path:
+                metrics_history.append({
+                    "step": step,
+                    "loss": round(step_loss, 4),
+                    "perplexity": round(ppl, 2),
+                    "tok_per_sec": tok_per_sec,
+                    "step_time_ms": round(step_dt * 1000, 2),
+                    "tokens_seen": (step + 1) * (tokens_per_iter * grad_accum_steps),
+                    "timestamp": time.time(),
+                })
+                try:
+                    os.makedirs(os.path.dirname(args.metrics_json_path) or ".", exist_ok=True)
+                    with open(args.metrics_json_path, "w") as f:
+                        json.dump(metrics_history, f, indent=2)
+                except Exception as e:
+                    print0(f"Warning: Failed to write metrics json ({e})")
 
     ckpt_manager.close()
+    if args.metrics_json_path and metrics_history:
+        try:
+            os.makedirs(os.path.dirname(args.metrics_json_path) or ".", exist_ok=True)
+            with open(args.metrics_json_path, "w") as f:
+                json.dump(metrics_history, f, indent=2)
+            print0(f"Saved {len(metrics_history)} training metric records to {args.metrics_json_path}")
+        except Exception as e:
+            print0(f"Warning: Failed to finalize metrics json ({e})")
     print0(f"Completed pretraining. Total runtime: {(time.time() - start_time) / 60:.2f}m")
 
 

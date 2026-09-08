@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--num_iterations", type=int, default=500, help="SFT optimization steps")
     p.add_argument("--device_batch_size", type=int, default=2, help="Per-device batch size")
     p.add_argument("--learning_rate", type=float, default=5e-5, help="Peak fine-tuning LR")
-    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/nano-chat-jax/checkpoints/full-dataset-run", help="GCS bucket for model checkpoints")
+    p.add_argument("--gcs_bucket", type=str, default="", help="GCS bucket for model checkpoints (optional)")
     p.add_argument("--checkpoint_dir", type=str, default="/tmp/checkpoints", help="Local directory to stage and save model checkpoints")
     p.add_argument("--sft_dataset_path", type=str, default="gs://your-bucket-name/nano-chat-jax/sft_dataset/sft_conversations.jsonl", help="Path to SFT dataset file (.jsonl)")
     p.add_argument("--load_model_tag", type=str, default="base_trained_gpt2_full", help="Checkpointed base model to load")
@@ -68,6 +68,7 @@ def parse_args():
     p.add_argument("--tokamax_k_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax k layout override")
     p.add_argument("--tokamax_v_layout", type=str, default=None, choices=["head_dim_minor", "seq_minor"], help="Tokamax v layout override")
     p.add_argument("--tokamax_use_experimental_scheduler", type=lambda x: (str(x).lower() == 'true'), default=None, help="Tokamax scheduler override (True/False)")
+    p.add_argument("--metrics_json_path", type=str, default=None, help="File path to save SFT training metrics JSON")
     return p.parse_args()
 
 
@@ -256,6 +257,14 @@ def main():
     bos_token = tokenizer.get_bos_token_id()
 
     print0(f"\n--- Starting Chat SFT for {args.num_iterations} iterations ---")
+    metrics_history = []
+    if args.metrics_json_path and os.path.exists(args.metrics_json_path):
+        try:
+            with open(args.metrics_json_path, "r") as f:
+                metrics_history = json.load(f)
+        except Exception:
+            metrics_history = []
+
     t0 = time.time()
 
     for step in range(args.num_iterations + 1):
@@ -318,9 +327,34 @@ def main():
         dt = time.time() - step_t0
 
         if step % 10 == 0 or step == args.num_iterations - 1 or (args.profile_start <= step < args.profile_end):
-            print0(f"Step {step:05d}/{args.num_iterations:05d} | SFT Loss: {loss.item():.4f} | {dt*1000:.1f}ms")
+            step_loss = float(loss.item())
+            ppl = float(np.exp(min(step_loss, 20.0)))
+            step_ms = round(dt * 1000, 2)
+            print0(f"Step {step:05d}/{args.num_iterations:05d} | SFT Loss: {step_loss:.4f} | PPL: {ppl:.2f} | {step_ms:.1f}ms")
+            if args.metrics_json_path:
+                metrics_history.append({
+                    "step": step,
+                    "sft_loss": round(step_loss, 4),
+                    "perplexity": round(ppl, 2),
+                    "step_time_ms": step_ms,
+                    "timestamp": time.time(),
+                })
+                try:
+                    os.makedirs(os.path.dirname(args.metrics_json_path) or ".", exist_ok=True)
+                    with open(args.metrics_json_path, "w") as f:
+                        json.dump(metrics_history, f, indent=2)
+                except Exception as e:
+                    print0(f"Warning: Failed to write SFT metrics json ({e})")
 
     sft_cm.close()
+    if args.metrics_json_path and metrics_history:
+        try:
+            os.makedirs(os.path.dirname(args.metrics_json_path) or ".", exist_ok=True)
+            with open(args.metrics_json_path, "w") as f:
+                json.dump(metrics_history, f, indent=2)
+            print0(f"Saved {len(metrics_history)} SFT metric records to {args.metrics_json_path}")
+        except Exception as e:
+            print0(f"Warning: Failed to finalize SFT metrics json ({e})")
     print0(f"Completed SFT fine-tuning in {(time.time() - t0):.2f}s")
 
     local_dataset_file = "/tmp/sft_dataset_staging.jsonl"

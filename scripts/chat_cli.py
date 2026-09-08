@@ -19,6 +19,7 @@ import threading
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from nanochat.gpt import GPT, GPTConfig, setup_distributed_sharding
@@ -35,9 +36,11 @@ def parse_args():
     p.add_argument("--max_tokens", type=int, default=32, help="Maximum generated tokens")
     p.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     p.add_argument("--top_k", type=int, default=40, help="Top-k filtering threshold")
+    p.add_argument("--checkpoint_dir", type=str, default="/tmp/checkpoints", help="Local checkpoint root directory")
     p.add_argument("--load_model_tag", type=str, default="final_sft_model", help="Model checkpoint tag to restore")
     p.add_argument("--load_step", type=int, default=-1, help="Explicit checkpoint step to restore (-1 = latest)")
-    p.add_argument("--gcs_bucket", type=str, default="gs://your-bucket-name/checkpoints/full-dataset-run", help="Direct GCS bucket string")
+    p.add_argument("--gcs_bucket", type=str, default="", help="Direct GCS bucket string (optional)")
+    p.add_argument("--interactive", action="store_true", help="Launch interactive multi-turn REPL prompt loop")
     p.add_argument("--raw_pretrain", action="store_true", help="Omit conversational special delimiters (<|bos|>) for pure base model evaluations")
     # Profiler Support
     p.add_argument("--profile_server_port", type=int, default=-1, help="Port to start JAX profiler server (-1 = disabled)")
@@ -138,9 +141,9 @@ def main():
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
 
-    staging_base = f"/tmp/checkpoints/{args.load_model_tag}"
-    remote_model = os.path.join(args.gcs_bucket, args.load_model_tag)
-    if args.gcs_bucket.startswith("gs://"):
+    staging_base = os.path.join(args.checkpoint_dir, args.load_model_tag)
+    if args.gcs_bucket and args.gcs_bucket.startswith("gs://"):
+        remote_model = os.path.join(args.gcs_bucket, args.load_model_tag)
         sync_from_gcs(remote_model, staging_base, specific_step=args.load_step)
 
     cm = CheckpointManager(staging_base)
@@ -153,46 +156,104 @@ def main():
                 _, model, _, _ = cm.restore(target_step, model=model)
             else:
                 _, model, _, _ = cm.restore_latest(model=model)
-            print0(f"Restored model weights directly from {remote_model} step {target_step}")
+            print0(f"Restored model weights directly from {staging_base} step {target_step}")
         except ValueError as e:
             print0(f"Note: Rotary buffer shape mismatch detected during restore ({e}). Running inference with resiliently matched shapes.")
     else:
-        print0("No checkpoint found; running inference with initialised weights.")
+        print0(f"No checkpoint found in {staging_base}; running inference with initialised weights.")
 
-    # Omit special conversational tokens if raw_pretrain flag is toggled
-    prepend_sym = None if args.raw_pretrain else "<|bos|>"
-    tokens = tokenizer.encode(args.prompt, prepend=prepend_sym)
-    rng = jax.random.PRNGKey(42)
+    @nnx.jit
+    def forward_pass(m, p_ids):
+        return m(p_ids)
 
-    eval_type = "[Pure Base Continuation]" if args.raw_pretrain else "[SFT Conversation Mode]"
-    print0(f"\nPrompt {eval_type}: {args.prompt}")
-    print0("Generating response...")
+    def generate_for_prompt(prompt_text):
+        prepend_sym = None if args.raw_pretrain else "<|bos|>"
+        tokens = tokenizer.encode(prompt_text, prepend=prepend_sym)
 
-    out_tokens = []
-    step = 0
-    for tok in model.generate(
-        rng, tokens, max_tokens=args.max_tokens, temperature=args.temperature, top_k=args.top_k
-    ):
-        if step == args.profile_start:
-            os.makedirs(args.profile_dir, exist_ok=True)
+        padded = np.zeros((1, args.max_seq_len), dtype=np.int32)
+        padded[0, :len(tokens)] = tokens
+        jnp_padded = jnp.array(padded)
+
+        eval_type = "[Pure Base Continuation]" if args.raw_pretrain else "[SFT Conversation Mode]"
+        print0(f"\nPrompt {eval_type}: {prompt_text}")
+        print0("Generating response: ", end="", flush=True)
+
+        cur_len = len(tokens)
+        out_tokens = []
+
+        logits = forward_pass(model, jnp_padded)
+
+        for step in range(args.max_tokens):
+            if cur_len >= args.max_seq_len:
+                break
+
+            if step == args.profile_start:
+                os.makedirs(args.profile_dir, exist_ok=True)
+                try:
+                    jax.profiler.start_trace(args.profile_dir)
+                    print0(f"\n[Profiler Tracing Enabled] Initiating detailed XLA trace at step {step}...")
+                except Exception as e:
+                    print0(f"\nWarning: Failed to initiate profiler trace ({e})")
+
+            if step == args.profile_end:
+                try:
+                    jax.profiler.stop_trace()
+                    print0(f"\n[Profiler Tracing Stopped] XLA trace finalized to {args.profile_dir}.")
+                except Exception as e:
+                    print0(f"\nWarning: Failed to stop profiler trace ({e})")
+
+            next_logits = np.array(logits[0, cur_len - 1])
+
+            if args.top_k is not None and args.top_k > 0:
+                k = min(args.top_k, len(next_logits))
+                top_k_indices = np.argsort(next_logits)[-k:]
+                top_k_logits = next_logits[top_k_indices]
+                if args.temperature > 0:
+                    top_k_logits = top_k_logits / args.temperature
+                    exp_logits = np.exp(top_k_logits - np.max(top_k_logits))
+                    probs = exp_logits / np.sum(exp_logits)
+                    next_tok = int(np.random.choice(top_k_indices, p=probs))
+                else:
+                    next_tok = int(top_k_indices[-1])
+            else:
+                if args.temperature > 0:
+                    logits_scaled = next_logits / args.temperature
+                    exp_logits = np.exp(logits_scaled - np.max(logits_scaled))
+                    probs = exp_logits / np.sum(exp_logits)
+                    next_tok = int(np.random.choice(len(probs), p=probs))
+                else:
+                    next_tok = int(np.argmax(next_logits))
+
+            out_tokens.append(next_tok)
+            tok_str = tokenizer.decode([next_tok])
+            sys.stdout.write(tok_str)
+            sys.stdout.flush()
+
+            padded[0, cur_len] = next_tok
+            cur_len += 1
+            jnp_padded = jnp.array(padded)
+
+            if not args.raw_pretrain and tok_str == "<|endoftext|>":
+                break
+
+            logits = forward_pass(model, jnp_padded)
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return out_tokens
+
+    if args.interactive:
+        print0("\n=== Interactive Inference Mode (Type 'quit' or 'exit' to stop) ===")
+        while True:
             try:
-                jax.profiler.start_trace(args.profile_dir)
-                print0(f"\n[Profiler Tracing Enabled] Initiating detailed XLA trace at generated token index {step} to {args.profile_dir}...")
-            except Exception as e:
-                print0(f"\nWarning: Failed to initiate profiler trace ({e})")
-
-        if step == args.profile_end:
-            try:
-                jax.profiler.stop_trace()
-                print0(f"\n[Profiler Tracing Stopped] XLA trace successfully finalized and saved to {args.profile_dir}.")
-            except Exception as e:
-                print0(f"\nWarning: Failed to stop profiler trace ({e})")
-
-        out_tokens.append(tok)
-        step += 1
-
-    full_output = tokenizer.decode(tokens + out_tokens)
-    print0(f"\nResult:\n{full_output}\n")
+                user_input = input("\nEnter prompt > ").strip()
+                if not user_input or user_input.lower() in ("quit", "exit"):
+                    break
+                generate_for_prompt(user_input)
+            except (KeyboardInterrupt, EOFError):
+                break
+    else:
+        generate_for_prompt(args.prompt)
 
 
 if __name__ == "__main__":

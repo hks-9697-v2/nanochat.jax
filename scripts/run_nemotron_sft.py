@@ -21,6 +21,8 @@ Usage:
 """
 
 import argparse
+import ast
+import glob
 import os
 import sys
 import json
@@ -84,7 +86,7 @@ def parse_args():
     p.add_argument(
         "--load_model_tag",
         type=str,
-        default="nemotron-base-run",
+        default="nemotron-base-3b",
         help="Tag name of the base model checkpoint to load weights from",
     )
     p.add_argument(
@@ -100,10 +102,16 @@ def parse_args():
         help="Specific step of the base model checkpoint to restore (-1 = latest)",
     )
     p.add_argument("--ckpt_every", type=int, default=50, help="SFT checkpoint saving interval")
+    p.add_argument(
+        "--metrics_json_path",
+        type=str,
+        default="/mnt/v7x8-disk/iharsh_workspace/results/sft_metrics.json",
+        help="Destination JSON path for step-by-step SFT performance and loss metrics",
+    )
 
     # Distributed Sharding
-    p.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
-    p.add_argument("--fsdp", type=int, default=8, help="FSDP sharding degree")
+    p.add_argument("--dp", type=int, default=8, help="Data parallelism degree")
+    p.add_argument("--fsdp", type=int, default=1, help="FSDP sharding degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
 
     # Attention Kernel & Tuning
@@ -127,8 +135,19 @@ def parse_args():
 def extract_conversation(row):
     """Extracts and normalizes raw Nemotron records into strict alternating user/assistant turns."""
     raw_msgs = []
-    rcp = row.get("responses_create_params") or {}
-    if isinstance(rcp, dict) and "input" in rcp and isinstance(rcp["input"], list):
+    rcp = row.get("responses_create_params")
+    if isinstance(rcp, str):
+        try:
+            rcp = ast.literal_eval(rcp)
+        except Exception:
+            try:
+                rcp = json.loads(rcp)
+            except Exception:
+                rcp = {}
+    if not isinstance(rcp, dict):
+        rcp = {}
+
+    if "input" in rcp and isinstance(rcp["input"], list):
         for msg in rcp["input"]:
             if isinstance(msg, dict) and "role" in msg and "content" in msg:
                 content = str(msg["content"]).strip()
@@ -208,19 +227,28 @@ def prepare_sft_dataset(args):
         for cfg in configs:
             if args.max_dialogues > 0 and count >= args.max_dialogues:
                 break
-            print0(f"\nStreaming SFT config '{cfg}' from {args.dataset_name} ...")
+            print0(f"\nProcessing SFT config '{cfg}' from {args.dataset_name} ...")
             try:
-                ds = load_dataset(args.dataset_name, cfg, split=args.split, streaming=True)
-                for row in ds:
-                    if args.max_dialogues > 0 and count >= args.max_dialogues:
-                        break
-                    msgs = extract_conversation(row)
-                    if not msgs:
-                        continue
+                from huggingface_hub import hf_hub_download
+                fpath = hf_hub_download(args.dataset_name, f"{cfg}.jsonl", repo_type="dataset")
+                with open(fpath, "r", encoding="utf-8") as f_in:
+                    for line in f_in:
+                        if args.max_dialogues > 0 and count >= args.max_dialogues:
+                            break
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        try:
+                            row = json.loads(line_str)
+                        except Exception:
+                            continue
+                        msgs = extract_conversation(row)
+                        if not msgs:
+                            continue
 
-                    f_out.write(json.dumps({"messages": msgs}, ensure_ascii=False) + "\n")
-                    count += 1
-                    pbar.update(1)
+                        f_out.write(json.dumps({"messages": msgs}, ensure_ascii=False) + "\n")
+                        count += 1
+                        pbar.update(1)
 
             except Exception as e:
                 print0(f"Warning: Failed to process config '{cfg}': {e}")
@@ -255,6 +283,7 @@ def run_sft_training(args, sft_jsonl_path):
         f"--dp={args.dp}",
         f"--fsdp={args.fsdp}",
         f"--tp={args.tp}",
+        f"--metrics_json_path={args.metrics_json_path}",
     ]
 
     print0(f"Executing: {' '.join(cmd)}\n")
