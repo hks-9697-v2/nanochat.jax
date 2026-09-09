@@ -150,9 +150,82 @@ Combine any parallelism configuration seamlessly via command line flags:
 - `--fsdp <N>`: Fully shard parameter optimization state across batch dimension.
 - `--tp <N>`: Partition Transformer Linear matrices across tensor attention heads.
 
+---
+
+## Hardware-Accelerated Attention Kernels (Tokamax Support)
+
+nanoChat.jax supports configurable attention kernels across all training and evaluation scripts via the `--attention_kernel` argument:
+
+- `--attention_kernel standard`: Default pure JAX einsum attention with causal masking. Compatible across all hardware backends.
+- `--attention_kernel tokamax`: Utilizes **Tokamax** (`tokamax.dot_product_attention`) to execute fused hardware-accelerated FlashAttention (via Pallas / Mosaic on TPUs and Triton/CuDNN on GPUs). Reduces attention memory from $O(T^2)$ down to linear $O(T)$ and significantly accelerates long-context pretraining and fine-tuning.
+
+### Kernel Tuning & Configuration Options
+
+On TPUs, Tokamax maps to Pallas Mosaic Splash Attention. By default, nanoChat.jax applies **optimal tuned tile configurations** discovered via benchmarking on TPU v7x, but you can freely switch back to Tokamax defaults or provide custom overrides:
+
+- `--tokamax_tune_mode auto` (**Default**): Uses optimal tuned block sizes and layouts discovered on hardware:
+  - **$T \le 1024$**: `block_q=1024, block_kv=1024, block_kv_compute=512`, backward `1024/1024/1024`, layout `SEQ_MINOR`.
+  - **$T \ge 2048$**: `block_q=512, block_kv=2048, block_kv_compute=2048`, backward `1024/2048/1024`, layout `HEAD_DIM_MINOR`, scheduler enabled.
+- `--tokamax_tune_mode tokamax_default`: Uses Tokamax's un-tuned default heuristics (`block_q=128, block_kv=128, block_kv_compute=128`).
+- `--tokamax_tune_mode custom`: Apply specific custom tile sizes and layouts using the override flags below.
+
+#### Granular Tile & Layout Overrides
+You can override any individual parameter from the command line:
+- `--tokamax_block_q <INT>`: Forward query tile size (must be divisible by 128)
+- `--tokamax_block_kv <INT>`: Forward key/value tile size
+- `--tokamax_block_kv_compute <INT>`: Forward KV compute chunk size
+- `--tokamax_block_q_dkv <INT>`: Backward query tile size
+- `--tokamax_block_kv_dkv <INT>`: Backward key/value tile size
+- `--tokamax_block_kv_dkv_compute <INT>`: Backward KV compute chunk size
+- `--tokamax_q_layout <head_dim_minor|seq_minor>`: Query memory layout
+- `--tokamax_k_layout <head_dim_minor|seq_minor>`: Key memory layout
+- `--tokamax_v_layout <head_dim_minor|seq_minor>`: Value memory layout
+- `--tokamax_use_experimental_scheduler <True|False>`: Pallas experimental warp scheduler
+
+### CLI Usage Examples
+
+```bash
+# 1. Base pretraining using Tokamax FlashAttention with tuned defaults (fastest):
+python scripts/base_train.py \
+    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
+    --attention_kernel tokamax \
+    --max_seq_len 1024 \
+    --device_batch_size 4
+
+# 2. Base pretraining using Tokamax built-in default heuristics (untuned):
+python scripts/base_train.py \
+    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
+    --attention_kernel tokamax \
+    --tokamax_tune_mode tokamax_default \
+    --max_seq_len 1024
+
+# 3. Custom tile overrides:
+python scripts/base_train.py \
+    --shard_dir "$NANOCHAT_STORAGE_ROOT/dataset_tokens" \
+    --attention_kernel tokamax \
+    --tokamax_tune_mode custom \
+    --tokamax_block_q 512 \
+    --tokamax_block_kv 1024 \
+    --tokamax_block_kv_compute 512
+
+# 4. Chat SFT fine-tuning with Tokamax:
+python scripts/chat_sft.py \
+    --sft_dataset_path "$NANOCHAT_STORAGE_ROOT/sft_dataset/sft_conversations.jsonl" \
+    --attention_kernel tokamax \
+    --load_model_tag base_trained_gpt2_full
+
+# 5. Interactive CLI generation with Tokamax:
+python scripts/chat_cli.py \
+    --attention_kernel tokamax \
+    --load_model_tag final_sft_model \
+    --prompt "What is the capital of France?"
+```
+
+---
+
 ## Unit Testing & Verification
 
-Run the local pytest suite to verify structural components, loss functions, distributed sharding configurations, and KV caching across active hardware slices:
+Run the local pytest suite to verify structural components, loss functions, distributed sharding configurations, KV caching, and equivalence between standard einsum and Tokamax attention across active hardware slices:
 
 ```bash
 pytest tests/ -v

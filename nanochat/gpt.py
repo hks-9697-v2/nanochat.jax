@@ -17,6 +17,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from nanochat.attention import dispatch_attention, get_tokamax_tpu_implementation
+
 
 @dataclass
 class GPTConfig:
@@ -26,6 +28,22 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    attention_kernel: str = "standard" # "standard" (einsum) or "tokamax" (hardware-accelerated flash attention)
+    # Tokamax tuning options:
+    # "auto" (default): use optimal tuned splash attention block sizes and layouts discovered on TPU
+    # "tokamax_default": use Tokamax's original built-in default heuristics (e.g. block_q=128)
+    # "custom": use user-specified overrides below
+    tokamax_tune_mode: str = "auto"
+    tokamax_block_q: int | None = None
+    tokamax_block_kv: int | None = None
+    tokamax_block_kv_compute: int | None = None
+    tokamax_block_q_dkv: int | None = None
+    tokamax_block_kv_dkv: int | None = None
+    tokamax_block_kv_dkv_compute: int | None = None
+    tokamax_q_layout: str | None = None # "head_dim_minor" or "seq_minor"
+    tokamax_k_layout: str | None = None
+    tokamax_v_layout: str | None = None
+    tokamax_use_experimental_scheduler: bool | None = None
 
 
 def norm(x):
@@ -57,6 +75,8 @@ class CausalSelfAttention(nnx.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        self.config = config
+        self.attention_kernel = getattr(config, "attention_kernel", "standard")
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
@@ -95,28 +115,16 @@ class CausalSelfAttention(nnx.Module):
         k = repeat_kv(k, nrep)
         v = repeat_kv(v, nrep)
 
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        scale = 1.0 / jnp.sqrt(self.head_dim)
-        att = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            mask = jnp.tril(jnp.ones((Tq, Tk), dtype=bool))[None, None, :, :]
-            att = jnp.where(mask, att, -jnp.inf)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            pass
-        else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            prefix_len = Tk - Tq
-            mask = (jnp.arange(Tk)[None, :] <= (jnp.arange(Tq)[:, None] + prefix_len))[None, None, :, :]
-            att = jnp.where(mask, att, -jnp.inf)
-
-        att = jax.nn.softmax(att, axis=-1)
-        y = jnp.einsum('bhqk,bhkd->bhqd', att, v)
-
-        # Re-assemble the heads side by side and project back to residual stream
-        y = jnp.transpose(y, (0, 2, 1, 3)).reshape(B, T, -1)
+        scale = float(1.0 / (self.head_dim ** 0.5))
+        y = dispatch_attention(
+            q,
+            k,
+            v,
+            kernel=self.attention_kernel,
+            config=self.config,
+            scale=scale,
+            kv_cache=kv_cache,
+        )
         y = self.c_proj(y)
         return y
     

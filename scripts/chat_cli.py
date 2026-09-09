@@ -44,6 +44,7 @@ def parse_args():
     p.add_argument("--profile_start", type=int, default=-1, help="Token index to start XLA trace recording")
     p.add_argument("--profile_end", type=int, default=-1, help="Token index to stop XLA trace recording")
     p.add_argument("--profile_dir", type=str, default="/tmp/tensorboard_traces", help="Trace destination directory")
+    p.add_argument("--attention_kernel", type=str, default="standard", choices=["standard", "tokamax"], help="Attention kernel: 'standard' (einsum) or 'tokamax' (hardware-accelerated flash attention)")
     return p.parse_args()
 
 
@@ -131,6 +132,7 @@ def main():
         n_head=num_heads,
         n_kv_head=num_heads,
         n_embd=model_dim,
+        attention_kernel=args.attention_kernel,
     )
 
     with jax.set_mesh(mesh):
