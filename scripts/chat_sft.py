@@ -208,6 +208,13 @@ def main():
 
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
+    scaling_params = model.num_scaling_params()
+    print0(
+        f"Initialised GPT base model with {scaling_params['total']:,} total parameters "
+        f"(Transformer: {scaling_params['transformer_matrices']:,} | "
+        f"Token Embeddings: {scaling_params['wte']:,} | "
+        f"LM Head: {scaling_params['lm_head']:,})"
+    )
 
     base_staging = f"/tmp/checkpoints/{args.load_model_tag}"
     remote_base = os.path.join(args.gcs_bucket, args.load_model_tag)

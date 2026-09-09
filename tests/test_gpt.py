@@ -256,3 +256,31 @@ def test_tokamax_tuning_options():
     assert out_custom.shape == (2, 128, 1024)
     assert not jnp.any(jnp.isnan(out_custom))
 
+
+def test_kernel_dispatcher_direct():
+    from nanochat.attention import dispatch_attention, standard_causal_attention, tokamax_dot_product_attention
+    q = jnp.ones((1, 2, 8, 16))
+    k = jnp.ones((1, 2, 8, 16))
+    v = jnp.ones((1, 2, 8, 16))
+    out = dispatch_attention(q, k, v, kernel="standard", scale=0.25)
+    assert out.shape == (1, 8, 32)
+
+
+def test_num_scaling_params():
+    config = GPTConfig(
+        sequence_len=32,
+        vocab_size=1024,
+        n_layer=2,
+        n_head=2,
+        n_kv_head=2,
+        n_embd=128,
+    )
+    model = GPT(config, rngs=nnx.Rngs(0))
+    counts = model.num_scaling_params()
+    assert "total" in counts
+    assert "transformer_matrices" in counts
+    assert "wte" in counts
+    assert "lm_head" in counts
+    assert counts["total"] > 0
+    assert counts["total"] == counts["transformer_matrices"] + counts["wte"] + counts["lm_head"]
+

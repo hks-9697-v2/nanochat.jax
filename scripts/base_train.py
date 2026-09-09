@@ -209,9 +209,14 @@ def main():
     with jax.set_mesh(mesh):
         model = GPT(config, rngs=nnx.Rngs(0))
     
-    params = nnx.state(model, nnx.Param)
-    total_params = sum(x.size for x in jax.tree.leaves(params))
-    print0(f"Initialised GPT base model with {total_params:,} parameters")
+    scaling_params = model.num_scaling_params()
+    total_params = scaling_params["total"]
+    print0(
+        f"Initialised GPT base model with {total_params:,} total parameters "
+        f"(Transformer: {scaling_params['transformer_matrices']:,} | "
+        f"Token Embeddings: {scaling_params['wte']:,} | "
+        f"LM Head: {scaling_params['lm_head']:,})"
+    )
 
     staging_base = f"/tmp/checkpoints/{args.model_tag}"
     os.makedirs(staging_base, exist_ok=True)

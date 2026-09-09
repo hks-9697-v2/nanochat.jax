@@ -139,20 +139,6 @@ class BOSFinder:
 # Grain data-source and transforms for pre-tokenized .bin shards
 # ============================================================================
 
-class CustomSharedMemoryDataSource(grain.sources.SharedMemoryDataSource):
-    """Thin wrapper that resolves paths and stores file list."""
-
-    def __init__(self, elements=None, *, name=None):
-        if elements is not None:
-            elements = [str(Path(p).resolve()) for p in elements]
-        super().__init__(elements, name=name)
-        self.files = [] if elements is None else elements
-        self.name = name
-
-    def __repr__(self):
-        return f"Fineweb10BSharedMemoryData(name={self.name}, len={len(self.files)})"
-
-
 class LoadShardTokens(grain.transforms.Map):
     """Grain map transform: read a .bin shard into shared memory."""
 
