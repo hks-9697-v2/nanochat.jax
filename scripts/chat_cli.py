@@ -165,10 +165,12 @@ def main():
     @nnx.jit
     def forward_pass(m, p_ids):
         return m(p_ids)
-
     def generate_for_prompt(prompt_text):
-        prepend_sym = None if args.raw_pretrain else "<|bos|>"
-        tokens = tokenizer.encode(prompt_text, prepend=prepend_sym)
+        if args.raw_pretrain:
+            tokens = tokenizer.encode(prompt_text)
+        else:
+            conv = {"messages": [{"role": "user", "content": prompt_text}, {"role": "assistant", "content": ""}]}
+            tokens = tokenizer.render_for_completion(conv)
 
         padded = np.zeros((1, args.max_seq_len), dtype=np.int32)
         padded[0, :len(tokens)] = tokens
@@ -233,7 +235,7 @@ def main():
             cur_len += 1
             jnp_padded = jnp.array(padded)
 
-            if not args.raw_pretrain and tok_str == "<|endoftext|>":
+            if not args.raw_pretrain and (tok_str in ("<|endoftext|>", "<|assistant_end|>") or "<|assistant_end|>" in tok_str or next_tok == 50256):
                 break
 
             logits = forward_pass(model, jnp_padded)
